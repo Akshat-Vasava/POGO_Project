@@ -1,0 +1,4 @@
+pyTelegramBotAPI==4.15.4
+google-genai==0.3.0
+pillow==10.2.0
+flask==3.0.2
