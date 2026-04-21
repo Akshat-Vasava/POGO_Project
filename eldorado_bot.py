@@ -49,52 +49,41 @@ def check_rate_limit():
 # 3. ADVANCED IMAGE PROCESSING (DIAGONAL WATERMARK & RAM OPTIMIZED)
 # =========================================================
 def apply_watermark(image, store_name="Galley-La"):
-    """Adds a massive, semi-transparent, diagonal watermark."""
+    """Adds a diagonal black watermark that actually stays inside the frame."""
     img_w, img_h = image.size
     
-    # 1. Start with a black text layer
-    txt = Image.new('L', (img_w, img_h))
-    d = ImageDraw.Draw(txt)
+    # 1. Create a transparent layer the exact same size as the collage
+    txt_layer = Image.new('RGBA', (img_w, img_h), (255, 255, 255, 0))
+    d = ImageDraw.Draw(txt_layer)
     
-    # 2. Configure font (dynamic size based on image width)
-    # Goal: text should be ~25% as tall as the image
-    font_size = int(img_h * 0.15) 
+    # 2. THE FIX: Scale the font based on WIDTH, not height!
+    # 12% of the image width keeps it prominent but safely inside the edges.
+    font_size = int(img_w * 0.12) 
+    
     try:
-        # Most servers don't have Arial, try different fonts, fall back to default
         font = ImageFont.truetype("arial.ttf", font_size)
     except IOError:
         try:
             font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
         except IOError:
-            # Last resort: very small and ugly, but won't crash
             font = ImageFont.load_default()
 
-    # 3. Calculate text center for centering on the canvas
+    # 3. Calculate exact center
     bbox = d.textbbox((0, 0), store_name, font=font)
     t_w = bbox[2] - bbox[0]
     t_h = bbox[3] - bbox[1]
     
-    # Draw text centered (starts at 255/pure white which is pure opacity)
-    d.text(((img_w - t_w) / 2, (img_h - t_h) / 2), store_name, font=font, fill=255)
+    # 4. Draw the text in pure BLACK (0, 0, 0) with 100/255 opacity (semi-transparent)
+    text_x = (img_w - t_w) / 2
+    text_y = (img_h - t_h) / 2
+    d.text((text_x, text_y), store_name, font=font, fill=(0, 0, 0, 100))
     
-    # 4. ROTATE: Turn the mask 45 degrees
-    # expand=True keeps the text from getting cut off on corners
-    # (Pillow's rotate with expand increases the canvas size)
-    rotated_txt = txt.rotate(45, expand=1, resample=Image.BICUBIC)
+    # 5. Rotate the transparent layer 45 degrees (expand=0 keeps the canvas size locked)
+    rotated_txt = txt_layer.rotate(45, expand=0, resample=Image.BICUBIC)
     
-    # 5. Crop it back down to the original image dimensions
-    r_w, r_h = rotated_txt.size
-    left = (r_w - img_w) / 2
-    top = (r_h - img_h) / 2
-    cropped_txt = rotated_txt.crop((left, top, left + img_w, top + img_h))
-    
-    # 6. ADJUST OPACITY (Make it semi-transparent)
-    # 255 is solid. 100-120 is very transparent, similar to your example image.
-    alpha = ImageEnhance.Brightness(cropped_txt).enhance(120 / 255)
-    
-    # 7. Apply the transparent text mask to the main image using solid black
-    black_layer = Image.new('RGB', (img_w, img_h), 'black')
-    image.paste(black_layer, (0, 0), alpha)
+    # 6. Paste the watermark over the original image
+    # The 'rotated_txt' acts as its own transparency mask here
+    image.paste(rotated_txt, (0, 0), rotated_txt)
     
     return image
 
