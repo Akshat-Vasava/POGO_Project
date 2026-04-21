@@ -24,8 +24,9 @@ ALLOWED_USERS = [5282482434, 7871741290, 1985905883, 929088783]
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Temporary storage for processing images
-TEMP_DIR = "temp_user_data"
+# Temporary storage for processing images (Using Absolute Paths for the Cloud)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMP_DIR = os.path.join(BASE_DIR, "temp_user_data")
 # Global tracker for the 15 RPM limit
 api_call_timestamps = []
 
@@ -241,25 +242,25 @@ def send_welcome(message):
 
 @bot.message_handler(content_types=['photo'])
 def handle_photos(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, f"⛔ Access Denied. Your actual Telegram ID is: {message.from_user.id}")
-        return
+    if message.from_user.id not in ALLOWED_USERS: return
 
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
     
-    # THE FIX: exist_ok=True stops Windows multi-threading crashes on photo albums
+    # CRITICAL CLOUD FIX: Force the creation of the parent and user directories
     os.makedirs(user_folder, exist_ok=True)
 
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
 
     file_path = os.path.join(user_folder, f"{message.photo[-1].file_id}.jpg")
+    
+    # Now that we guarantee the folder exists via absolute path, save the file
     with open(file_path, 'wb') as new_file:
         new_file.write(downloaded_file)
 
     bot.reply_to(message, "Screenshot received! Send more, or type /generate.")
-
+    
 @bot.message_handler(commands=['generate'])
 def process_listing(message):
     if message.from_user.id not in ALLOWED_USERS:
