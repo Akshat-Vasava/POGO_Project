@@ -88,36 +88,77 @@ def apply_watermark(image, store_name="Galley-La"):
     return image
 
 def create_collage(image_folder, output_path):
-    """Stitches images one-by-one with compression to prevent Cloud OOM."""
+    """Builds a seamless masonry collage with no black backgrounds."""
     image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     if not image_files: return None
 
-    # Get dimensions from first image, then close
-    with Image.open(os.path.join(image_folder, image_files[0])) as first_img:
-        base_width, base_height = first_img.size
+    # Load images
+    imgs = [Image.open(os.path.join(image_folder, f)).convert("RGB") for f in image_files]
+    n = len(imgs)
+    
+    # Dynamic row calculation (e.g., 5 images = 2 rows of 2 and 3)
+    rows_count = 2 if n <= 4 else 3
+    base = n // rows_count
+    extra = n % rows_count
+    layout = [base] * rows_count
+    for i in range(extra): 
+        layout[i] += 1
 
-    # RAM SAVER: Shrink resolution by 50%
-    width = int(base_width * 0.5)
-    height = int(base_height * 0.5)
+    # Base width set to 2000px: High quality but safe for 512MB RAM servers
+    canvas_width = 2000 
+    idx = 0
+    rows_data = []
 
-    cols = math.ceil(math.sqrt(len(image_files)))
-    rows = math.ceil(len(image_files) / cols)
-    collage = Image.new('RGB', (cols * width, rows * height), color=(0,0,0))
+    # The Core Engine: Resize to match heights, then scale to canvas width
+    for count in layout:
+        row_imgs = imgs[idx:idx + count]
+        idx += count
+        
+        target_h = min([i.height for i in row_imgs])
+        
+        resized = []
+        total_w = 0
+        for img in row_imgs:
+            ratio = target_h / img.height
+            new_w = int(img.width * ratio)
+            new_h = int(target_h)
+            r = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            resized.append(r)
+            total_w += new_w
+            
+        scale = canvas_width / total_w
+        final_row = []
+        row_h = 0
+        for img in resized:
+            new_w = int(img.width * scale)
+            new_h = int(img.height * scale)
+            r = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            final_row.append(r)
+            row_h = new_h
+            
+        rows_data.append((final_row, row_h))
 
-    # RAM SAVER: Process one image at a time
-    for index, f in enumerate(image_files):
-        file_path = os.path.join(image_folder, f)
-        with Image.open(file_path) as img:
-            img_resized = img.resize((width, height))
-            row = index // cols
-            col = index % cols
-            collage.paste(img_resized, (col * width, row * height))
+    # Build the final canvas without gaps
+    total_height = sum(h for _, h in rows_data)
+    collage = Image.new("RGB", (canvas_width, total_height), (255, 255, 255))
 
-    # Apply the NEW diagonal watermark
-    # Change "Eldorado Store" to whatever you want stamped!
+    y = 0
+    for row, h in rows_data:
+        x = 0
+        for img in row:
+            collage.paste(img, (x, y))
+            x += img.width
+        y += h
+
+    # Free up memory
+    for img in imgs: 
+        img.close()
+
+    # Apply the perfectly scaled diagonal watermark
     collage = apply_watermark(collage, "Galley-La")
     
-    collage.save(output_path, quality=85)
+    # Save with high quality
+    collage.save(output_path, "JPEG", quality=95)
     return collage, output_path
 
 # =========================================================
@@ -213,10 +254,9 @@ def process_listing(message):
         # Free up 'm' message to prevent chat clutter
         bot.delete_message(m.chat.id, m.message_id)
 
-        # Decouple collage file instantly from hard drive before sending
+       # Send as an uncompressed document to maintain maximum quality
         with open(final_path, 'rb') as file_data:
-            # We send directly without Pillow to save even more RAM
-            bot.send_photo(message.chat.id, file_data, caption="Here's your watermarked image! Generate AI text?")
+            bot.send_document(message.chat.id, file_data, caption="Here's your high-quality watermarked image! Generate AI text?", visible_file_name="Galley_La_Collage.jpg")
 
         # Prompt for AI text generation
         markup = types.InlineKeyboardMarkup()
