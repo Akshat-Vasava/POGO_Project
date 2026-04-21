@@ -92,9 +92,9 @@ def apply_watermark(image, store_name="Galley-La"):
     # 255 is solid. 100-120 is very transparent, similar to your example image.
     alpha = ImageEnhance.Brightness(cropped_txt).enhance(120 / 255)
     
-    # 7. Apply the transparent text mask to the main image using solid white
-    white = Image.new('RGB', (img_w, img_h), 'white')
-    image.paste(white, (0, 0), alpha)
+    # 7. Apply the transparent text mask to the main image using solid black
+    black_layer = Image.new('RGB', (img_w, img_h), 'black')
+    image.paste(black_layer, (0, 0), alpha)
     
     return image
 
@@ -195,8 +195,8 @@ def handle_photos(message):
     with open(file_path, 'wb') as new_file:
         new_file.write(downloaded_file)
 
-    # Simple reply to not spam their chat while uploading 10 images
-    bot.reply_to(message, "Screenshot received!")
+    # Simple reply so they know the image saved and what to do next
+    bot.reply_to(message, "Screenshot received! Send more, or type /generate.")
 
 @bot.message_handler(commands=['generate'])
 def process_listing(message):
