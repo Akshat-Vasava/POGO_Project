@@ -72,50 +72,52 @@ def apply_watermark(image, store_name="Eldorado Store"):
     return image
 
 def create_collage(image_folder, output_path):
-    """Stitches images into a grid and applies a watermark."""
+    """Stitches images into a grid efficiently to prevent Cloud OOM crashes."""
     image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     if not image_files: return None
 
-    # THE FIX: 100% decouple images from the hard drive into RAM
-    images = []
-    for f in image_files:
-        file_path = os.path.join(image_folder, f)
-        with open(file_path, 'rb') as file_data:
-            img = Image.open(io.BytesIO(file_data.read()))
-            images.append(img)
+    # Get dimensions from the first image, then immediately close it
+    with Image.open(os.path.join(image_folder, image_files[0])) as first_img:
+        base_width, base_height = first_img.size
 
-    cols = math.ceil(math.sqrt(len(images)))
-    rows = math.ceil(len(images) / cols)
+    # RAM SAVER: Shrink the collage resolution by 50%
+    width = int(base_width * 0.5)
+    height = int(base_height * 0.5)
 
-    width, height = images[0].size
+    cols = math.ceil(math.sqrt(len(image_files)))
+    rows = math.ceil(len(image_files) / cols)
+
     collage = Image.new('RGB', (cols * width, rows * height), color=(0,0,0))
 
-    for index, img in enumerate(images):
-        img = img.resize((width, height))
-        row = index // cols
-        col = index % cols
-        collage.paste(img, (col * width, row * height))
+    # RAM SAVER: Open, paste, and close ONE image at a time
+    for index, f in enumerate(image_files):
+        file_path = os.path.join(image_folder, f)
+        with Image.open(file_path) as img:
+            img_resized = img.resize((width, height))
+            row = index // cols
+            col = index % cols
+            collage.paste(img_resized, (col * width, row * height))
 
-    # Apply watermark before saving
-    collage = apply_watermark(collage, "YOUR STORE NAME")
-    collage.save(output_path, quality=95)
+    # Apply watermark and save with slightly compressed quality
+    collage = apply_watermark(collage, "Eldorado Store")
+    collage.save(output_path, quality=85)
     return collage, output_path
 
 # =========================================================
 # 4. AI LISTING GENERATION
 # =========================================================
 def generate_listing_description(image_folder):
-    """Sends the raw, uncompressed screenshots to Gemini 2.5 Flash."""
+    """Sends the screenshots to Gemini, compressed to save RAM."""
     image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     
-    # THE FIX: 100% decouple images from the hard drive into RAM
+    # RAM SAVER: Compress images to 1024px before holding them in RAM
     raw_images = []
     for f in image_files:
         file_path = os.path.join(image_folder, f)
-        with open(file_path, 'rb') as file_data:
-            img = Image.open(io.BytesIO(file_data.read()))
-            raw_images.append(img)
-    
+        with Image.open(file_path) as img:
+            img.thumbnail((1024, 1024)) # Shrinks image while keeping aspect ratio
+            raw_images.append(img.copy())
+            
     prompt = """
     You are an expert Pokemon GO account seller on Eldorado and a master digital marketer. 
     Analyze these screenshots from a single Pokemon GO account and extract all visible stats, items, and rare Pokemon.
