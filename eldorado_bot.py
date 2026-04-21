@@ -18,7 +18,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Only users in this list can interact with the bot. 
 # Add your numeric Telegram IDs here.
-ALLOWED_USERS = [5282482434, 7871741290] 
+ALLOWED_USERS = [5282482434, 7871741290, 1985905883, 929088783] 
 
 # Initialize APIs
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
