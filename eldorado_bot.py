@@ -96,13 +96,20 @@ def create_collage(image_folder, output_path):
     imgs = [Image.open(os.path.join(image_folder, f)).convert("RGB") for f in image_files]
     n = len(imgs)
     
-    # Dynamic row calculation (e.g., 5 images = 2 rows of 2 and 3)
-    rows_count = 2 if n <= 4 else 3
-    base = n // rows_count
-    extra = n % rows_count
-    layout = [base] * rows_count
-    for i in range(extra): 
-        layout[i] += 1
+    # CUSTOM LAYOUT LOGIC: Force a 3-2 grid for 5 images
+    if n == 5:
+        layout = [3, 2] # 3 on top, 2 on the bottom
+    elif n <= 4:
+        # 1 to 4 images stay in 1 or 2 rows
+        layout = [math.ceil(n/2), n // 2] if n > 1 else [1]
+    else:
+        # 6 or more images get safely split into 3 rows
+        rows_count = 3
+        base = n // rows_count
+        extra = n % rows_count
+        layout = [base] * rows_count
+        for i in range(extra): 
+            layout[i] += 1
 
     # Base width set to 2000px: High quality but safe for 512MB RAM servers
     canvas_width = 2000 
