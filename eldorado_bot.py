@@ -227,7 +227,7 @@ def generate_listing_description(image_folder):
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, "⛔ Access Denied. You are not authorized to use this bot.")
+        bot.reply_to(message, f"⛔ Access Denied. Your actual Telegram ID is: {message.from_user.id}")
         return
 
     welcome_text = (
@@ -241,7 +241,9 @@ def send_welcome(message):
 
 @bot.message_handler(content_types=['photo'])
 def handle_photos(message):
-    if message.from_user.id not in ALLOWED_USERS: return
+    if message.from_user.id not in ALLOWED_USERS:
+        bot.reply_to(message, f"⛔ Access Denied. Your actual Telegram ID is: {message.from_user.id}")
+        return
 
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
@@ -260,7 +262,9 @@ def handle_photos(message):
 
 @bot.message_handler(commands=['generate'])
 def process_listing(message):
-    if message.from_user.id not in ALLOWED_USERS: return
+    if message.from_user.id not in ALLOWED_USERS:
+        bot.reply_to(message, f"⛔ Access Denied. Your actual Telegram ID is: {message.from_user.id}")
+        return
 
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
