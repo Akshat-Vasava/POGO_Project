@@ -7,13 +7,12 @@ import telebot
 from flask import Flask
 from PIL import Image, ImageDraw, ImageFont
 from google import genai
-from google.genai import types
+
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 
 bot = telebot.TeleBot(BOT_TOKEN)
-genai.configure(api_key=GEMINI_API_KEY)
 
 # Dictionary to hold the tiny file_ids instead of heavy images
 user_sessions = {}
@@ -46,7 +45,7 @@ def generate_listing_description(collage_image):
         
         # Call the model using the new syntax
         response = client.models.generate_content(
-            model='gemini-2.5-flash', # Upgraded to the latest 2.5 flash model
+            model='gemini-2.5-flash',
             contents=[prompt, collage_image]
         )
         return response.text
