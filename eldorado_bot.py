@@ -6,8 +6,8 @@ import threading
 import telebot
 from flask import Flask
 from PIL import Image, ImageDraw, ImageFont
-import google.generativeai as genai
-
+from google import genai
+from google.genai import types
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
@@ -34,8 +34,8 @@ def run_server():
 def generate_listing_description(collage_image):
     """Uses Gemini to analyze the stats and write the Eldorado listing."""
     try:
-        # Use the flash model for faster, free-tier friendly responses
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Initialize the new Google GenAI client
+        client = genai.Client(api_key=GEMINI_API_KEY)
         
         prompt = """
         You are an expert copywriter for an Eldorado.gg storefront specializing in Pokémon GO accounts.
@@ -44,7 +44,11 @@ def generate_listing_description(collage_image):
         Keep it organized with bullet points, use gaming emojis, and end with a strong call to action to buy the account safely.
         """
         
-        response = model.generate_content([prompt, collage_image])
+        # Call the model using the new syntax
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', # Upgraded to the latest 2.5 flash model
+            contents=[prompt, collage_image]
+        )
         return response.text
     except Exception as e:
         return f"⚠️ AI Generation Failed: {e}\n\n(Google's servers might be overloaded right now. You can try again later.)"
