@@ -1,49 +1,39 @@
 import os
 import math
 import shutil
-import time
-import io
 import telebot
 from telebot import types
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
-from google import genai
 from flask import Flask
-from threading import Thread
+from threading import Thread, Timer
 
 # =========================================================
 # 1. CONFIGURATION & ACCESS CONTROL (CLOUD-SECURE)
 # =========================================================
 # Remember to set these on Koyeb, NOT in the code!
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Hardcode your authorized numeric IDs here
 ALLOWED_USERS = [5282482434, 7871741290, 1985905883, 929088783, 6201618260] 
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Absolute path setup for cloud file system stability
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(BASE_DIR, "temp_user_data")
 
-# Global tracker for the 15 RPM limit
-api_call_timestamps = []
+# Per-user watermark preference (default: ON)
+# Key: user_id (int), Value: True (watermark on) / False (watermark off)
+user_watermark_settings = {}
 
-# =========================================================
-# 2. RATE LIMITER
-# =========================================================
-def check_rate_limit():
-    """Ensures we do not exceed 14 requests per 60 seconds."""
-    global api_call_timestamps
-    current_time = time.time()
-    api_call_timestamps = [t for t in api_call_timestamps if current_time - t < 60]
-    
-    if len(api_call_timestamps) >= 14:
-        wait_time = int(60 - (current_time - api_call_timestamps[0]))
-        return False, wait_time
-        
-    return True, 0
+# Per-user custom watermark text (default: "Galley-La")
+# Key: user_id (int), Value: custom text string
+user_watermark_text = {}
+
+# Per-user photo batch tracking (for debounced reply)
+# Key: chat_id (str), Value: count of images in current batch
+user_photo_count = {}
+user_photo_timers = {}
 
 # =========================================================
 # 3. ADVANCED IMAGE PROCESSING (DIAGONAL WATERMARK & RAM OPTIMIZED)
@@ -87,7 +77,7 @@ def apply_watermark(image, store_name="Galley-La"):
     
     return image
 
-def create_collage(image_folder, output_path):
+def create_collage(image_folder, output_path, watermark_enabled=True, watermark_text="Galley-La"):
     """Builds a seamless masonry collage with no black backgrounds."""
     image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     if not image_files: return None
@@ -161,45 +151,17 @@ def create_collage(image_folder, output_path):
     for img in imgs: 
         img.close()
 
-    # Apply the perfectly scaled diagonal watermark
-    collage = apply_watermark(collage, "Galley-La")
+    # Apply the perfectly scaled diagonal watermark (if enabled)
+    if watermark_enabled:
+        collage = apply_watermark(collage, watermark_text)
     
     # Save with high quality
     collage.save(output_path, "JPEG", quality=95)
     return collage, output_path
 
-# =========================================================
-# 4. AI LISTING GENERATION
-# =========================================================
-def generate_listing_description(image_folder):
-    """Sends AI-optimized thumbnails to Gemini to save cloud RAM."""
-    image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    
-    # RAM SAVER: Decouple from hard drive and compress to 1024px before holding in RAM
-    raw_images = []
-    for f in image_files:
-        file_path = os.path.join(image_folder, f)
-        # Decouple instantly from hard drive
-        with open(file_path, 'rb') as file_data:
-            with Image.open(io.BytesIO(file_data.read())) as img:
-                # Shrink for AI payload, save hundreds of megabytes of server RAM
-                img.thumbnail((1024, 1024))
-                raw_images.append(img.copy())
-            
-    prompt = """
-    You are an expert Pokemon GO account seller on Eldorado and a master digital marketer...
-    # (Keep your entire long prompt text exactly the same here!)
-    """
-    
-    content_to_send = [prompt] + raw_images
-    response = client.models.generate_content(
-        model="gemini-2.5-flash", 
-        contents=content_to_send
-    )
-    return response.text
 
 # =========================================================
-# 5. TELEGRAM BOT HANDLERS
+# 4. TELEGRAM BOT HANDLERS
 # =========================================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -211,8 +173,8 @@ def send_welcome(message):
     welcome_text = (
         "🤖 **Eldorado Listing Bot (Cloud Optimized) is Online!**\n\n"
         "1. Send screenshots.\n"
-        "2. Type /generate.\n"
-        "3. I'll build a memory-safe collage and prompt for AI text."
+        "2. Type /generate to build a collage.\n"
+        "3. Use /watermark to toggle watermark settings."
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode='Markdown')
 
@@ -232,8 +194,103 @@ def handle_photos(message):
     with open(file_path, 'wb') as new_file:
         new_file.write(downloaded_file)
 
-    # Simple reply so they know the image saved and what to do next
-    bot.reply_to(message, "Screenshot received! Send more, or type /generate.")
+    # Increment photo count for this user
+    user_photo_count[user_id] = user_photo_count.get(user_id, 0) + 1
+
+    # Cancel any existing timer for this user (debounce)
+    if user_id in user_photo_timers:
+        user_photo_timers[user_id].cancel()
+
+    # Start a new 2-second timer; fires only after user stops sending photos
+    chat_id = message.chat.id
+    def send_batch_reply():
+        count = user_photo_count.pop(user_id, 0)
+        user_photo_timers.pop(user_id, None)
+        if count > 0:
+            bot.send_message(chat_id, f"📸 {count} Images received! Send more, or type /generate.")
+
+    timer = Timer(2.0, send_batch_reply)
+    user_photo_timers[user_id] = timer
+    timer.start()
+
+@bot.message_handler(commands=['watermark'])
+def toggle_watermark(message):
+    """Lets the user turn watermark on or off via inline buttons."""
+    if message.from_user.id not in ALLOWED_USERS: return
+
+    user_id = message.from_user.id
+    current = user_watermark_settings.get(user_id, True)
+    current_text = user_watermark_text.get(user_id, "Galley-La")
+    status = "✅ ON" if current else "❌ OFF"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Turn ON", callback_data="wm_on"),
+        types.InlineKeyboardButton("❌ Turn OFF", callback_data="wm_off")
+    )
+    markup.add(
+        types.InlineKeyboardButton("✏️ Custom Text", callback_data="wm_text")
+    )
+    bot.send_message(
+        message.chat.id,
+        f"🔖 **Watermark Settings**\n\nCurrent status: {status}\nCurrent text: `{current_text}`\n\nChoose an option below:",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data in ['wm_on', 'wm_off', 'wm_text'])
+def handle_watermark_toggle(call):
+    """Handles the inline button press for watermark toggle."""
+    if call.from_user.id not in ALLOWED_USERS:
+        bot.answer_callback_query(call.id, "⛔ Denied.")
+        return
+
+    user_id = call.from_user.id
+
+    if call.data == "wm_on":
+        user_watermark_settings[user_id] = True
+        bot.edit_message_text(
+            "🔖 **Watermark Settings**\n\nCurrent status: ✅ ON\n\n_Watermark will be applied to your collages._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Watermark turned ON ✅")
+    elif call.data == "wm_off":
+        user_watermark_settings[user_id] = False
+        bot.edit_message_text(
+            "🔖 **Watermark Settings**\n\nCurrent status: ❌ OFF\n\n_Collages will be generated without watermark._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Watermark turned OFF ❌")
+    elif call.data == "wm_text":
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🔤 Reply with the text for your custom watermark:",
+        )
+        bot.register_next_step_handler(msg, receive_custom_watermark_text)
+        bot.answer_callback_query(call.id, "Enter your custom text ✏️")
+
+def receive_custom_watermark_text(message):
+    """Captures the user's custom watermark text from the next message."""
+    if message.from_user.id not in ALLOWED_USERS: return
+
+    user_id = message.from_user.id
+    custom_text = message.text.strip() if message.text else None
+
+    if not custom_text:
+        bot.reply_to(message, "❌ Invalid input. Please use /watermark and try again.")
+        return
+
+    user_watermark_text[user_id] = custom_text
+    # Also auto-enable watermark when setting custom text
+    user_watermark_settings[user_id] = True
+    bot.reply_to(
+        message,
+        f"✅ Custom watermark set to: `{custom_text}`\n\n_Watermark has been turned ON automatically._",
+        parse_mode='Markdown'
+    )
 
 @bot.message_handler(commands=['generate'])
 def process_listing(message):
@@ -251,7 +308,9 @@ def process_listing(message):
     m = bot.send_message(message.chat.id, "⚙️ Building memory-safe collage...")
 
     try:
-        collage_result = create_collage(user_folder, collage_path)
+        watermark_on = user_watermark_settings.get(message.from_user.id, True)
+        wm_text = user_watermark_text.get(message.from_user.id, "Galley-La")
+        collage_result = create_collage(user_folder, collage_path, watermark_enabled=watermark_on, watermark_text=wm_text)
         if not collage_result:
             bot.edit_message_text("Error building collage.", m.chat.id, m.message_id)
             return
@@ -263,13 +322,8 @@ def process_listing(message):
 
        # Send as an uncompressed document to maintain maximum quality
         with open(final_path, 'rb') as file_data:
-            bot.send_document(message.chat.id, file_data, caption="Here's your high-quality watermarked image! Generate AI text?", visible_file_name="Galley_La_Collage.jpg")
-
-        # Prompt for AI text generation
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Yes", callback_data="desc_yes"))
-        markup.add(types.InlineKeyboardButton("❌ No", callback_data="desc_no"))
-        bot.send_message(message.chat.id, "Generate Eldorado & Social Media copy?", reply_markup=markup)
+            wm_label = "watermarked " if user_watermark_settings.get(message.from_user.id, True) else ""
+            bot.send_document(message.chat.id, file_data, caption=f"Here's your high-quality {wm_label}image!", visible_file_name="Galley_La_Collage.jpg")
 
     except Exception as e:
         bot.reply_to(message, f"An error occurred: {str(e)}")
@@ -279,36 +333,6 @@ def process_listing(message):
                 shutil.rmtree(user_folder)
         except: pass
 
-@bot.callback_query_handler(func=lambda call: call.data in ['desc_yes', 'desc_no'])
-def handle_description_choice(call):
-    if call.from_user.id not in ALLOWED_USERS:
-        bot.answer_callback_query(call.id, "⛔ Denied.")
-        return
-        
-    user_id = str(call.message.chat.id)
-    user_folder = os.path.join(TEMP_DIR, user_id)
-
-    if call.data == "desc_yes":
-        can_proceed, wait_time = check_rate_limit()
-        if not can_proceed:
-            bot.answer_callback_query(call.id, f"⏳ Cooldown. Try again in {wait_time}s.", show_alert=True)
-            return
-
-        api_call_timestamps.append(time.time())
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(call.message.chat.id, "🧠 Analyzing compressed thumbnails...")
-        
-        try:
-            description = generate_listing_description(user_folder)
-            bot.send_message(call.message.chat.id, f"**Eldorado Listing Text:**\n\n{description}", parse_mode='Markdown')
-        except Exception as e:
-            # Catch 503 errors and rate limits gracefully
-            bot.send_message(call.message.chat.id, f"AI Error: {str(e)}")
-            
-    elif call.data == "desc_no":
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(call.message.chat.id, "AI text skipped.")
-
     # CLOUD FIX: Safe Cleanup prevents random Windows permissions/ghost errors from locking folders
     try:
         if os.path.exists(user_folder):
@@ -317,10 +341,10 @@ def handle_description_choice(call):
         # Prints to Koyeb console, does not notify user
         print(f"[*] Cleanup warning for {user_id}: {e}")
     
-    bot.send_message(call.message.chat.id, "✅ Session cleared.")
+    bot.send_message(message.chat.id, "✅ Session cleared.")
 
 # =========================================================
-# 6. KOYEB KEEP-ALIVE SERVER (WEBSERVER FOR HEALTH CHECKS)
+# 5. KOYEB KEEP-ALIVE SERVER (WEBSERVER FOR HEALTH CHECKS)
 # =========================================================
 app = Flask(__name__)
 
@@ -341,7 +365,7 @@ def keep_awake():
     t.start()
 
 # =========================================================
-# 7. EXECUTION
+# 6. EXECUTION
 # =========================================================
 if __name__ == "__main__":
     # Ensure root temp directory exists on cloud start
