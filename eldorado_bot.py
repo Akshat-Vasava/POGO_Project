@@ -2,7 +2,7 @@ import os
 import math
 import shutil
 import telebot
-from telebot import types
+from telebot import types, apihelper
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from flask import Flask
 from threading import Thread, Timer
@@ -81,6 +81,10 @@ ALLOWED_USERS = [5282482434, 7871741290, 1985905883, 929088783, 6201618260]
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
+# Set global timeouts for pyTelegramBotAPI to prevent write timeouts on slow connections
+apihelper.CONNECT_TIMEOUT = 90
+apihelper.READ_TIMEOUT = 90
+
 # Absolute path setup for cloud file system stability
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(BASE_DIR, "temp_user_data")
@@ -93,6 +97,18 @@ user_watermark_settings = {}
 # Key: user_id (int), Value: custom text string
 user_watermark_text = {}
 
+# Available watermark colors with their RGBA representations (including semi-transparency)
+WATERMARK_COLORS = {
+    "black": {"name": "⚫ Black", "rgba": (0, 0, 0, 100)},
+    "white": {"name": "⚪ White", "rgba": (255, 255, 255, 130)},
+    "red": {"name": "🔴 Red", "rgba": (255, 0, 0, 100)},
+    "yellow": {"name": "🟡 Yellow", "rgba": (255, 255, 0, 100)}
+}
+
+# Per-user watermark color preference (default: "black")
+# Key: user_id (int), Value: color key string
+user_watermark_colors = {}
+
 # Per-user photo batch tracking (for debounced reply)
 # Key: chat_id (str), Value: count of images in current batch
 user_photo_count = {}
@@ -102,20 +118,21 @@ user_photo_timers = {}
 # Key: user_id (int), Value: "document" / "photo"
 user_quality_settings = {}
 
+# Per-user layout preference (default: "auto" for dynamic layout, "vertical" / "horizontal" / "grid")
+# Key: user_id (int), Value: "auto" / "vertical" / "horizontal" / "grid"
+user_layout_settings = {}
+
 # =========================================================
 # 3. ADVANCED IMAGE PROCESSING (DIAGONAL WATERMARK & RAM OPTIMIZED)
 # =========================================================
-def apply_watermark(image, store_name="Galley-La"):
-    """Adds a diagonal black watermark that actually stays inside the frame."""
+def apply_watermark(image, store_name="Galley-La", color_rgba=(0, 0, 0, 100)):
+    """Adds a diagonal watermark with a custom color centered and scaled to fit without clipping."""
     img_w, img_h = image.size
     
-    # 1. Create a transparent layer the exact same size as the collage
-    txt_layer = Image.new('RGBA', (img_w, img_h), (255, 255, 255, 0))
-    d = ImageDraw.Draw(txt_layer)
-    
-    # 2. THE FIX: Scale the font based on WIDTH, not height!
-    # 12% of the image width keeps it prominent but safely inside the edges.
-    font_size = int(img_w * 0.12) 
+    # 1. Dynamically scale font size relative to the minimum dimension to prevent overflow
+    base_dim = min(img_w, img_h)
+    font_size = int(base_dim * 0.12)
+    font_size = max(40, min(font_size, 200)) # Keep font bounds safe
     
     try:
         font = ImageFont.truetype("arial.ttf", font_size)
@@ -125,26 +142,43 @@ def apply_watermark(image, store_name="Galley-La"):
         except IOError:
             font = ImageFont.load_default()
 
-    # 3. Calculate exact center
-    bbox = d.textbbox((0, 0), store_name, font=font)
+    # Measure exact text dimensions
+    dummy = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+    dummy_draw = ImageDraw.Draw(dummy)
+    bbox = dummy_draw.textbbox((0, 0), store_name, font=font)
     t_w = bbox[2] - bbox[0]
     t_h = bbox[3] - bbox[1]
     
-    # 4. Draw the text in pure BLACK (0, 0, 0) with 100/255 opacity (semi-transparent)
-    text_x = (img_w - t_w) / 2
-    text_y = (img_h - t_h) / 2
-    d.text((text_x, text_y), store_name, font=font, fill=(0, 0, 0, 100))
+    # Add a small padding margin around the text
+    padding = 20
+    t_w_padded = t_w + padding
+    t_h_padded = t_h + padding
+
+    # 2. Create a square that can hold the rotated text diagonal perfectly
+    diagonal = int(math.ceil(math.sqrt(t_w_padded**2 + t_h_padded**2)))
     
-    # 5. Rotate the transparent layer 45 degrees (expand=0 keeps the canvas size locked)
-    rotated_txt = txt_layer.rotate(45, expand=0, resample=Image.BICUBIC)
+    # Create the square transparent image
+    watermark_sq = Image.new('RGBA', (diagonal, diagonal), (255, 255, 255, 0))
+    d_sq = ImageDraw.Draw(watermark_sq)
     
-    # 6. Paste the watermark over the original image
-    # The 'rotated_txt' acts as its own transparency mask here
-    image.paste(rotated_txt, (0, 0), rotated_txt)
+    # Draw text perfectly centered in the square (accounting for potential font offsets)
+    text_x = (diagonal - t_w) / 2 - bbox[0]
+    text_y = (diagonal - t_h) / 2 - bbox[1]
+    d_sq.text((text_x, text_y), store_name, font=font, fill=color_rgba)
+    
+    # 3. Rotate the square watermark by 45 degrees
+    # Since it is a square and fits the text diagonal, rotation will not clip it
+    rotated_sq = watermark_sq.rotate(45, expand=0, resample=Image.BICUBIC)
+    
+    # 4. Paste the rotated square centered onto the main canvas
+    paste_x = int((img_w - diagonal) / 2)
+    paste_y = int((img_h - diagonal) / 2)
+    
+    image.paste(rotated_sq, (paste_x, paste_y), rotated_sq)
     
     return image
 
-def create_collage(image_folder, output_path, watermark_enabled=True, watermark_text="Galley-La"):
+def create_collage(image_folder, output_path, watermark_enabled=True, watermark_text="Galley-La", layout_style="auto", watermark_color="black"):
     """Builds a seamless masonry collage with no black backgrounds."""
     image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     if not image_files: return None
@@ -153,20 +187,50 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
     imgs = [Image.open(os.path.join(image_folder, f)).convert("RGB") for f in image_files]
     n = len(imgs)
     
-    # CUSTOM LAYOUT LOGIC: Force a 3-2 grid for 5 images
-    if n == 5:
-        layout = [3, 2] # 3 on top, 2 on the bottom
-    elif n <= 4:
-        # 1 to 4 images stay in 1 or 2 rows
-        layout = [math.ceil(n/2), n // 2] if n > 1 else [1]
-    else:
-        # 6 or more images get safely split into 3 rows
-        rows_count = 3
-        base = n // rows_count
-        extra = n % rows_count
-        layout = [base] * rows_count
-        for i in range(extra): 
-            layout[i] += 1
+    # Calculate layout list based on user preference
+    if layout_style == "vertical":
+        layout = [1] * n
+    elif layout_style == "horizontal":
+        layout = [n]
+    elif layout_style == "grid":
+        # Balanced Grid layout
+        if n <= 3:
+            layout = [n]
+        elif n == 4:
+            layout = [2, 2]
+        elif n == 5:
+            layout = [3, 2]
+        elif n == 6:
+            layout = [3, 3]
+        elif n == 7:
+            layout = [3, 2, 2]
+        elif n == 8:
+            layout = [3, 3, 2]
+        elif n == 9:
+            layout = [3, 3, 3]
+        else:
+            # Fallback for > 9 images: split as evenly as possible into rows of size sqrt(n)
+            rows_count = math.ceil(math.sqrt(n))
+            base = n // rows_count
+            extra = n % rows_count
+            layout = [base] * rows_count
+            for i in range(extra):
+                layout[i] += 1
+    else: # "auto"
+        # CUSTOM LAYOUT LOGIC: Force a 3-2 grid for 5 images
+        if n == 5:
+            layout = [3, 2] # 3 on top, 2 on the bottom
+        elif n <= 4:
+            # 1 to 4 images stay in 1 or 2 rows
+            layout = [math.ceil(n/2), n // 2] if n > 1 else [1]
+        else:
+            # 6 or more images get safely split into 3 rows
+            rows_count = 3
+            base = n // rows_count
+            extra = n % rows_count
+            layout = [base] * rows_count
+            for i in range(extra): 
+                layout[i] += 1
 
     # Base width set to 2000px: High quality but safe for 512MB RAM servers
     canvas_width = 2000 
@@ -220,7 +284,8 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
 
     # Apply the perfectly scaled diagonal watermark (if enabled)
     if watermark_enabled:
-        collage = apply_watermark(collage, watermark_text)
+        color_info = WATERMARK_COLORS.get(watermark_color, WATERMARK_COLORS["black"])
+        collage = apply_watermark(collage, watermark_text, color_rgba=color_info["rgba"])
     
     # Save with high quality
     collage.save(output_path, "JPEG", quality=95)
@@ -243,7 +308,8 @@ def send_welcome(message):
         "2. Type /generate to build a collage.\n"
         "3. Use /clear to discard uploaded photos and start over.\n"
         "4. Use /watermark to toggle watermark settings.\n"
-        "5. Use /quality to choose between high-quality document and fast photo output."
+        "5. Use /quality to choose between high-quality document and fast photo output.\n"
+        "6. Use /layout to choose collage layout style (Grid, Auto, Vertical, Horizontal)."
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode='Markdown')
 
@@ -290,6 +356,9 @@ def toggle_watermark(message):
     user_id = message.from_user.id
     current = user_watermark_settings.get(user_id, True)
     current_text = user_watermark_text.get(user_id, "Galley-La")
+    current_color_key = user_watermark_colors.get(user_id, "black")
+    color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
+    current_color_name = color_info["name"]
     status = "✅ ON" if current else "❌ OFF"
 
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -298,11 +367,12 @@ def toggle_watermark(message):
         types.InlineKeyboardButton("❌ Turn OFF", callback_data="wm_off")
     )
     markup.add(
-        types.InlineKeyboardButton("✏️ Custom Text", callback_data="wm_text")
+        types.InlineKeyboardButton("✏️ Custom Text", callback_data="wm_text"),
+        types.InlineKeyboardButton("🎨 Choose Color", callback_data="wm_color_menu")
     )
     bot.send_message(
         message.chat.id,
-        f"🔖 **Watermark Settings**\n\nCurrent status: {status}\nCurrent text: `{current_text}`\n\nChoose an option below:",
+        f"🔖 **Watermark Settings**\n\nCurrent status: {status}\nCurrent text: `{current_text}`\nCurrent color: {current_color_name}\n\nChoose an option below:",
         parse_mode='Markdown',
         reply_markup=markup
     )
@@ -353,9 +423,47 @@ def clear_session(message):
     else:
         bot.reply_to(message, "🤷 No photos found to clear.")
 
-@bot.callback_query_handler(func=lambda call: call.data in ['wm_on', 'wm_off', 'wm_text', 'q_document', 'q_photo'])
+@bot.message_handler(commands=['layout'])
+def toggle_layout(message):
+    """Lets the user choose their collage layout style via inline buttons."""
+    if message.from_user.id not in ALLOWED_USERS: return
+
+    user_id = message.from_user.id
+    current = user_layout_settings.get(user_id, "auto")
+    
+    style_names = {
+        "auto": "🤖 Auto (Default)",
+        "vertical": "↕️ Single Column (Vertical)",
+        "horizontal": "↔️ Single Row (Horizontal)",
+        "grid": "🔲 Balanced Grid"
+    }
+    status = style_names.get(current, "🤖 Auto (Default)")
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🤖 Auto", callback_data="l_auto"),
+        types.InlineKeyboardButton("🔲 Balanced Grid", callback_data="l_grid")
+    )
+    markup.add(
+        types.InlineKeyboardButton("↕️ Vertical Column", callback_data="l_vertical"),
+        types.InlineKeyboardButton("↔️ Horizontal Row", callback_data="l_horizontal")
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        f"📐 **Collage Layout Settings**\n\nCurrent style: *{status}*\n\nChoose a layout format for your collage:",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data in [
+    'wm_on', 'wm_off', 'wm_text', 'wm_color_menu', 'wm_back',
+    'wmc_black', 'wmc_white', 'wmc_red', 'wmc_yellow',
+    'q_document', 'q_photo',
+    'l_auto', 'l_grid', 'l_vertical', 'l_horizontal'
+])
 def handle_callback_query(call):
-    """Handles all inline button clicks for watermark and quality settings."""
+    """Handles all inline button clicks for watermark, quality, and layout settings."""
     if call.from_user.id not in ALLOWED_USERS:
         bot.answer_callback_query(call.id, "⛔ Denied.")
         return
@@ -364,20 +472,103 @@ def handle_callback_query(call):
 
     if call.data == "wm_on":
         user_watermark_settings[user_id] = True
+        current_text = user_watermark_text.get(user_id, "Galley-La")
+        current_color_key = user_watermark_colors.get(user_id, "black")
+        color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
+        current_color_name = color_info["name"]
         bot.edit_message_text(
-            "🔖 **Watermark Settings**\n\nCurrent status: ✅ ON\n\n_Watermark will be applied to your collages._",
+            f"🔖 **Watermark Settings**\n\nCurrent status: ✅ ON\nCurrent text: `{current_text}`\nCurrent color: {current_color_name}\n\n_Watermark will be applied to your collages._",
             call.message.chat.id, call.message.message_id,
             parse_mode='Markdown'
         )
         bot.answer_callback_query(call.id, "Watermark turned ON ✅")
     elif call.data == "wm_off":
         user_watermark_settings[user_id] = False
+        current_text = user_watermark_text.get(user_id, "Galley-La")
+        current_color_key = user_watermark_colors.get(user_id, "black")
+        color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
+        current_color_name = color_info["name"]
         bot.edit_message_text(
-            "🔖 **Watermark Settings**\n\nCurrent status: ❌ OFF\n\n_Collages will be generated without watermark._",
+            f"🔖 **Watermark Settings**\n\nCurrent status: ❌ OFF\nCurrent text: `{current_text}`\nCurrent color: {current_color_name}\n\n_Collages will be generated without watermark._",
             call.message.chat.id, call.message.message_id,
             parse_mode='Markdown'
         )
         bot.answer_callback_query(call.id, "Watermark turned OFF ❌")
+    elif call.data == "wm_color_menu":
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("⚫ Black", callback_data="wmc_black"),
+            types.InlineKeyboardButton("⚪ White", callback_data="wmc_white")
+        )
+        markup.add(
+            types.InlineKeyboardButton("🔴 Red", callback_data="wmc_red"),
+            types.InlineKeyboardButton("🟡 Yellow", callback_data="wmc_yellow")
+        )
+        markup.add(
+            types.InlineKeyboardButton("⬅️ Back", callback_data="wm_back")
+        )
+        
+        current_color_key = user_watermark_colors.get(user_id, "black")
+        color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
+        current_color_name = color_info["name"]
+        
+        bot.edit_message_text(
+            f"🎨 **Select Watermark Color**\n\nCurrent color: {current_color_name}\n\nChoose a color that stands out on your images:",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id)
+    elif call.data == "wm_back":
+        current = user_watermark_settings.get(user_id, True)
+        current_text = user_watermark_text.get(user_id, "Galley-La")
+        current_color_key = user_watermark_colors.get(user_id, "black")
+        color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
+        current_color_name = color_info["name"]
+        status = "✅ ON" if current else "❌ OFF"
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("✅ Turn ON", callback_data="wm_on"),
+            types.InlineKeyboardButton("❌ Turn OFF", callback_data="wm_off")
+        )
+        markup.add(
+            types.InlineKeyboardButton("✏️ Custom Text", callback_data="wm_text"),
+            types.InlineKeyboardButton("🎨 Choose Color", callback_data="wm_color_menu")
+        )
+        bot.edit_message_text(
+            f"🔖 **Watermark Settings**\n\nCurrent status: {status}\nCurrent text: `{current_text}`\nCurrent color: {current_color_name}\n\nChoose an option below:",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id)
+    elif call.data.startswith("wmc_"):
+        color_key = call.data.split("_")[1]
+        user_watermark_colors[user_id] = color_key
+        
+        color_info = WATERMARK_COLORS.get(color_key, WATERMARK_COLORS["black"])
+        color_name = color_info["name"]
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("⚫ Black", callback_data="wmc_black"),
+            types.InlineKeyboardButton("⚪ White", callback_data="wmc_white")
+        )
+        markup.add(
+            types.InlineKeyboardButton("🔴 Red", callback_data="wmc_red"),
+            types.InlineKeyboardButton("🟡 Yellow", callback_data="wmc_yellow")
+        )
+        markup.add(
+            types.InlineKeyboardButton("⬅️ Back", callback_data="wm_back")
+        )
+        bot.edit_message_text(
+            f"🎨 **Select Watermark Color**\n\nCurrent color: {color_name}\n\nChoose a color that stands out on your images:",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id, f"Watermark color set to {color_name} 🎨")
     elif call.data == "wm_text":
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         msg = bot.send_message(
@@ -402,6 +593,38 @@ def handle_callback_query(call):
             parse_mode='Markdown'
         )
         bot.answer_callback_query(call.id, "Saved: Photo mode 🖼️")
+    elif call.data == "l_auto":
+        user_layout_settings[user_id] = "auto"
+        bot.edit_message_text(
+            "📐 **Collage Layout Settings**\n\nCurrent style: 🤖 Auto (Default)\n\n_The bot will dynamically pick the best layout for your screenshots._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Saved: Auto layout 🤖")
+    elif call.data == "l_grid":
+        user_layout_settings[user_id] = "grid"
+        bot.edit_message_text(
+            "📐 **Collage Layout Settings**\n\nCurrent style: 🔲 Balanced Grid\n\n_Images will be distributed evenly in a grid (e.g. 2x2, 3x3)._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Saved: Balanced Grid 🔲")
+    elif call.data == "l_vertical":
+        user_layout_settings[user_id] = "vertical"
+        bot.edit_message_text(
+            "📐 **Collage Layout Settings**\n\nCurrent style: ↕️ Single Column (Vertical)\n\n_Every image will be placed in a single row stacked vertically._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Saved: Vertical Column ↕️")
+    elif call.data == "l_horizontal":
+        user_layout_settings[user_id] = "horizontal"
+        bot.edit_message_text(
+            "📐 **Collage Layout Settings**\n\nCurrent style: ↔️ Single Row (Horizontal)\n\n_All images will be placed next to each other in a single horizontal row._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Saved: Horizontal Row ↔️")
 
 def receive_custom_watermark_text(message):
     """Captures the user's custom watermark text from the next message."""
@@ -452,7 +675,16 @@ def process_listing(message):
     try:
         watermark_on = user_watermark_settings.get(message.from_user.id, True)
         wm_text = user_watermark_text.get(message.from_user.id, "Galley-La")
-        collage_result = create_collage(user_folder, collage_path, watermark_enabled=watermark_on, watermark_text=wm_text)
+        layout_pref = user_layout_settings.get(message.from_user.id, "auto")
+        wm_color = user_watermark_colors.get(message.from_user.id, "black")
+        collage_result = create_collage(
+            user_folder, 
+            collage_path, 
+            watermark_enabled=watermark_on, 
+            watermark_text=wm_text, 
+            layout_style=layout_pref,
+            watermark_color=wm_color
+        )
         if not collage_result:
             try:
                 bot.delete_message(m.chat.id, m.message_id)
@@ -476,14 +708,16 @@ def process_listing(message):
                 bot.send_photo(
                     message.chat.id,
                     file_data,
-                    caption=f"Here's your {wm_label}collage!"
+                    caption=f"Here's your {wm_label}collage!",
+                    timeout=90
                 )
             else:
                 bot.send_document(
                     message.chat.id,
                     file_data,
                     caption=f"Here's your high-quality {wm_label}image!",
-                    visible_file_name="Galley_La_Collage.jpg"
+                    visible_file_name="Galley_La_Collage.jpg",
+                    timeout=90
                 )
 
     except Exception as e:
