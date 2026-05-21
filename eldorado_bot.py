@@ -1,13 +1,17 @@
 import os
 import math
 import shutil
+import json
 import telebot
 from telebot import types, apihelper
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont
 from flask import Flask
 from threading import Thread, Timer
 import time
 import stat
+
+# Maximum number of photos a user can upload per session (prevents RAM exhaustion)
+MAX_PHOTOS_PER_SESSION = 20
 
 def safe_delete_folder(folder_path):
     """Safely deletes a folder, handling Windows file locking and read-only permissions robustly."""
@@ -88,14 +92,7 @@ apihelper.READ_TIMEOUT = 90
 # Absolute path setup for cloud file system stability
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(BASE_DIR, "temp_user_data")
-
-# Per-user watermark preference (default: ON)
-# Key: user_id (int), Value: True (watermark on) / False (watermark off)
-user_watermark_settings = {}
-
-# Per-user custom watermark text (default: "Galley-La")
-# Key: user_id (int), Value: custom text string
-user_watermark_text = {}
+SETTINGS_FILE = os.path.join(BASE_DIR, "user_settings.json")
 
 # Available watermark colors with their RGBA representations (including semi-transparency)
 WATERMARK_COLORS = {
@@ -105,6 +102,14 @@ WATERMARK_COLORS = {
     "yellow": {"name": "🟡 Yellow", "rgba": (255, 255, 0, 100)}
 }
 
+# Per-user watermark preference (default: ON)
+# Key: user_id (int), Value: True (watermark on) / False (watermark off)
+user_watermark_settings = {}
+
+# Per-user custom watermark text (default: "Galley-La")
+# Key: user_id (int), Value: custom text string
+user_watermark_text = {}
+
 # Per-user watermark color preference (default: "black")
 # Key: user_id (int), Value: color key string
 user_watermark_colors = {}
@@ -113,6 +118,7 @@ user_watermark_colors = {}
 # Key: chat_id (str), Value: count of images in current batch
 user_photo_count = {}
 user_photo_timers = {}
+user_photo_receiving_msg = {}  # Tracks the "Receiving images..." message object per user for cleanup
 
 # Per-user quality preference (default: "document" for high-quality document, "photo" for compressed photo)
 # Key: user_id (int), Value: "document" / "photo"
@@ -121,6 +127,43 @@ user_quality_settings = {}
 # Per-user layout preference (default: "auto" for dynamic layout, "vertical" / "horizontal" / "grid")
 # Key: user_id (int), Value: "auto" / "vertical" / "horizontal" / "grid"
 user_layout_settings = {}
+
+# =========================================================
+# 2. SETTINGS PERSISTENCE (Survive Restarts)
+# =========================================================
+def save_user_settings():
+    """Persists all user preferences to a JSON file so they survive bot restarts."""
+    data = {
+        "watermark_settings": {str(k): v for k, v in user_watermark_settings.items()},
+        "watermark_text": {str(k): v for k, v in user_watermark_text.items()},
+        "watermark_colors": {str(k): v for k, v in user_watermark_colors.items()},
+        "quality_settings": {str(k): v for k, v in user_quality_settings.items()},
+        "layout_settings": {str(k): v for k, v in user_layout_settings.items()},
+    }
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[*] Warning: Could not save user settings: {e}")
+
+def load_user_settings():
+    """Loads all user preferences from the JSON file on startup."""
+    global user_watermark_settings, user_watermark_text, user_watermark_colors
+    global user_quality_settings, user_layout_settings
+    if not os.path.exists(SETTINGS_FILE):
+        return
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            data = json.load(f)
+        # Convert string keys back to int keys
+        user_watermark_settings = {int(k): v for k, v in data.get("watermark_settings", {}).items()}
+        user_watermark_text = {int(k): v for k, v in data.get("watermark_text", {}).items()}
+        user_watermark_colors = {int(k): v for k, v in data.get("watermark_colors", {}).items()}
+        user_quality_settings = {int(k): v for k, v in data.get("quality_settings", {}).items()}
+        user_layout_settings = {int(k): v for k, v in data.get("layout_settings", {}).items()}
+        print(f"[*] Loaded user settings for {len(user_watermark_settings)} user(s).")
+    except Exception as e:
+        print(f"[*] Warning: Could not load user settings: {e}")
 
 # =========================================================
 # 3. ADVANCED IMAGE PROCESSING (DIAGONAL WATERMARK & RAM OPTIMIZED)
@@ -180,7 +223,7 @@ def apply_watermark(image, store_name="Galley-La", color_rgba=(0, 0, 0, 100)):
 
 def create_collage(image_folder, output_path, watermark_enabled=True, watermark_text="Galley-La", layout_style="auto", watermark_color="black"):
     """Builds a seamless masonry collage with no black backgrounds."""
-    image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != "final_collage.jpg"]
     if not image_files: return None
 
     # Load images
@@ -295,23 +338,40 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
 # =========================================================
 # 4. TELEGRAM BOT HANDLERS
 # =========================================================
-@bot.message_handler(commands=['start', 'help'])
+@bot.message_handler(commands=['start'])
 def send_welcome(message):
     if message.from_user.id not in ALLOWED_USERS:
-        # Diagnostic mode: Tell authorized users who have wrong IDs what they are
         bot.reply_to(message, f"⛔ Access Denied. Your numeric Telegram ID is: {message.from_user.id}")
         return
 
+    user_name = message.from_user.first_name or "Nakama"
     welcome_text = (
-        "🤖 **Galley-La Bot is Online!**\n\n"
-        "1. Send screenshots.\n"
-        "2. Type /generate to build a collage.\n"
-        "3. Use /clear to discard uploaded photos and start over.\n"
-        "4. Use /watermark to toggle watermark settings.\n"
-        "5. Use /quality to choose between high-quality document and fast photo output.\n"
-        "6. Use /layout to choose collage layout style (Grid, Auto, Vertical, Horizontal)."
+        f"🏴‍☠️ **Welcome aboard, {user_name}!**\n\n"
+        "I'm the *Galley-La Bot* — your personal collage builder! 🛠️\n\n"
+        "Just send me your screenshots and I'll stitch them into a clean, "
+        "professional collage with watermarks, custom layouts, and more.\n\n"
+        "Ready to set sail? 📸 Send your first photos!\n\n"
+        "💡 _Type /help anytime to see all available commands._"
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['help'])
+def send_help(message):
+    if message.from_user.id not in ALLOWED_USERS:
+        bot.reply_to(message, f"⛔ Access Denied. Your numeric Telegram ID is: {message.from_user.id}")
+        return
+
+    help_text = (
+        "📖 **Command Reference**\n\n"
+        "📸 *Send photos* — Upload screenshots to the bot.\n"
+        "⚙️ /generate — Build a collage from your uploaded photos.\n"
+        "🗑️ /clear — Discard uploaded photos and start over.\n"
+        "🔖 /watermark — Toggle watermark on/off, set custom text & color.\n"
+        "⚡ /quality — Choose between high-quality document or fast photo output.\n"
+        "📐 /layout — Pick collage layout style (Auto, Grid, Vertical, Horizontal).\n\n"
+        f"📌 _Photo limit: {MAX_PHOTOS_PER_SESSION} images per session._"
+    )
+    bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
 
 @bot.message_handler(content_types=['photo'])
 def handle_photos(message):
@@ -321,6 +381,12 @@ def handle_photos(message):
     user_folder = os.path.join(TEMP_DIR, user_id)
     # CLOUD FIX: Absolute path path guaranteed folder creation
     os.makedirs(user_folder, exist_ok=True)
+
+    # Enforce photo upload limit to prevent RAM exhaustion
+    existing_photos = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != "final_collage.jpg"]
+    if len(existing_photos) >= MAX_PHOTOS_PER_SESSION:
+        bot.reply_to(message, f"⚠️ Maximum limit of {MAX_PHOTOS_PER_SESSION} photos reached! Use /generate to build your collage or /clear to start over.")
+        return
 
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
@@ -332,6 +398,14 @@ def handle_photos(message):
     # Increment photo count for this user
     user_photo_count[user_id] = user_photo_count.get(user_id, 0) + 1
 
+    # Send an instant "Receiving images..." message on the first photo of a batch
+    if user_photo_count[user_id] == 1:
+        try:
+            receiving_msg = bot.send_message(message.chat.id, "📥 _Receiving images..._", parse_mode='Markdown')
+            user_photo_receiving_msg[user_id] = receiving_msg
+        except Exception:
+            pass
+
     # Cancel any existing timer for this user (debounce)
     if user_id in user_photo_timers:
         user_photo_timers[user_id].cancel()
@@ -341,6 +415,13 @@ def handle_photos(message):
     def send_batch_reply():
         count = user_photo_count.pop(user_id, 0)
         user_photo_timers.pop(user_id, None)
+        # Delete the "Receiving images..." message
+        receiving_msg = user_photo_receiving_msg.pop(user_id, None)
+        if receiving_msg:
+            try:
+                bot.delete_message(receiving_msg.chat.id, receiving_msg.message_id)
+            except Exception:
+                pass
         if count > 0:
             bot.send_message(chat_id, f"📸 {count} Images received! Send more, or type /generate.")
 
@@ -472,6 +553,7 @@ def handle_callback_query(call):
 
     if call.data == "wm_on":
         user_watermark_settings[user_id] = True
+        save_user_settings()
         current_text = user_watermark_text.get(user_id, "Galley-La")
         current_color_key = user_watermark_colors.get(user_id, "black")
         color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
@@ -484,6 +566,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id, "Watermark turned ON ✅")
     elif call.data == "wm_off":
         user_watermark_settings[user_id] = False
+        save_user_settings()
         current_text = user_watermark_text.get(user_id, "Galley-La")
         current_color_key = user_watermark_colors.get(user_id, "black")
         color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
@@ -546,6 +629,7 @@ def handle_callback_query(call):
     elif call.data.startswith("wmc_"):
         color_key = call.data.split("_")[1]
         user_watermark_colors[user_id] = color_key
+        save_user_settings()
         
         color_info = WATERMARK_COLORS.get(color_key, WATERMARK_COLORS["black"])
         color_name = color_info["name"]
@@ -579,6 +663,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id, "Enter your custom text ✏️")
     elif call.data == "q_document":
         user_quality_settings[user_id] = "document"
+        save_user_settings()
         bot.edit_message_text(
             "⚡ **Image Quality & Format Settings**\n\nCurrent mode: 📄 Document (High Quality)\n\n_Collages will be sent as uncompressed files to keep maximum detail._",
             call.message.chat.id, call.message.message_id,
@@ -587,6 +672,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id, "Saved: Document mode 📄")
     elif call.data == "q_photo":
         user_quality_settings[user_id] = "photo"
+        save_user_settings()
         bot.edit_message_text(
             "⚡ **Image Quality & Format Settings**\n\nCurrent mode: 🖼️ Photo (Compressed/Fast)\n\n_Collages will be sent as standard images for quick in-chat previews and easy sharing._",
             call.message.chat.id, call.message.message_id,
@@ -595,6 +681,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id, "Saved: Photo mode 🖼️")
     elif call.data == "l_auto":
         user_layout_settings[user_id] = "auto"
+        save_user_settings()
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: 🤖 Auto (Default)\n\n_The bot will dynamically pick the best layout for your screenshots._",
             call.message.chat.id, call.message.message_id,
@@ -603,6 +690,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id, "Saved: Auto layout 🤖")
     elif call.data == "l_grid":
         user_layout_settings[user_id] = "grid"
+        save_user_settings()
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: 🔲 Balanced Grid\n\n_Images will be distributed evenly in a grid (e.g. 2x2, 3x3)._",
             call.message.chat.id, call.message.message_id,
@@ -611,6 +699,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id, "Saved: Balanced Grid 🔲")
     elif call.data == "l_vertical":
         user_layout_settings[user_id] = "vertical"
+        save_user_settings()
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: ↕️ Single Column (Vertical)\n\n_Every image will be placed in a single row stacked vertically._",
             call.message.chat.id, call.message.message_id,
@@ -619,6 +708,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id, "Saved: Vertical Column ↕️")
     elif call.data == "l_horizontal":
         user_layout_settings[user_id] = "horizontal"
+        save_user_settings()
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: ↔️ Single Row (Horizontal)\n\n_All images will be placed next to each other in a single horizontal row._",
             call.message.chat.id, call.message.message_id,
@@ -640,6 +730,7 @@ def receive_custom_watermark_text(message):
     user_watermark_text[user_id] = custom_text
     # Also auto-enable watermark when setting custom text
     user_watermark_settings[user_id] = True
+    save_user_settings()
     bot.reply_to(
         message,
         f"✅ Custom watermark set to: `{custom_text}`\n\n_Watermark has been turned ON automatically._",
@@ -659,8 +750,8 @@ def process_listing(message):
         bot.reply_to(message, "Send photos first, then /generate.")
         return
 
-    # Count the photos in the user's folder
-    image_files = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    # Count the photos in the user's folder (exclude any previously generated collage)
+    image_files = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != "final_collage.jpg"]
     num_images = len(image_files)
 
     caption_text = f"⚙️ Building collage from {num_images} images..."
@@ -694,11 +785,6 @@ def process_listing(message):
             
         _, final_path = collage_result
         
-        # Free up loading message to prevent chat clutter
-        try:
-            bot.delete_message(m.chat.id, m.message_id)
-        except: pass
-
         # Send collage based on user's format preference
         quality_pref = user_quality_settings.get(message.from_user.id, "document")
         wm_label = "watermarked " if watermark_on else ""
@@ -720,6 +806,11 @@ def process_listing(message):
                     timeout=90
                 )
 
+        # Free up loading message to prevent chat clutter after collage has been sent
+        try:
+            bot.delete_message(m.chat.id, m.message_id)
+        except: pass
+
     except Exception as e:
         bot.reply_to(message, f"An error occurred: {str(e)}")
         # Delete the loading message if it was sent
@@ -731,6 +822,7 @@ def process_listing(message):
             if os.path.exists(user_folder):
                 safe_delete_folder(user_folder)
         except: pass
+        return  # Stop here — do not send misleading "Session cleared" after an error
 
     # CLOUD FIX: Safe Cleanup prevents random Windows permissions/ghost errors from locking folders
     try:
@@ -769,6 +861,9 @@ def keep_awake():
 if __name__ == "__main__":
     # Ensure root temp directory exists on cloud start
     if not os.path.exists(TEMP_DIR): os.makedirs(TEMP_DIR)
+    
+    # Load persisted user settings from previous sessions
+    load_user_settings()
     
     # Start the keep-awake web server
     keep_awake()
