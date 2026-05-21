@@ -6,12 +6,75 @@ from telebot import types
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from flask import Flask
 from threading import Thread, Timer
+import time
+import stat
+
+def safe_delete_folder(folder_path):
+    """Safely deletes a folder, handling Windows file locking and read-only permissions robustly."""
+    if not os.path.exists(folder_path):
+        return True
+
+    def remove_readonly(func, path, excinfo):
+        """Error handler for shutil.rmtree to handle read-only files."""
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+
+    # Try standard rmtree with read-only handler first with retries
+    for attempt in range(5):
+        try:
+            shutil.rmtree(folder_path, onerror=remove_readonly)
+            return True
+        except Exception:
+            time.sleep(0.2) # Wait a tiny bit for the OS to release locks and retry
+
+    # If that still fails, delete files individually as a fallback
+    try:
+        for root, dirs, files in os.walk(folder_path, topdown=False):
+            for file in files:
+                file_path = os.path.join(root, file)
+                for attempt in range(5):
+                    try:
+                        os.chmod(file_path, stat.S_IWRITE)
+                        os.remove(file_path)
+                        break
+                    except Exception:
+                        time.sleep(0.1)
+            for dir in dirs:
+                dir_path = os.path.join(root, dir)
+                for attempt in range(5):
+                    try:
+                        os.chmod(dir_path, stat.S_IWRITE)
+                        os.rmdir(dir_path)
+                        break
+                    except Exception:
+                        time.sleep(0.1)
+        os.rmdir(folder_path)
+        return True
+    except Exception as e:
+        print(f"[*] Final deletion fallback failed for {folder_path}: {e}")
+        return False
 
 # =========================================================
 # 1. CONFIGURATION & ACCESS CONTROL (CLOUD-SECURE)
 # =========================================================
 # Remember to set these on Koyeb, NOT in the code!
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+# Fallback: Parse local .env file if running locally without the environment variable set
+if not TELEGRAM_BOT_TOKEN:
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    if key.strip() == "TELEGRAM_BOT_TOKEN":
+                        TELEGRAM_BOT_TOKEN = value.strip().strip("'").strip('"')
+                        os.environ["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
+                        break
 
 # Hardcode your authorized numeric IDs here
 ALLOWED_USERS = [5282482434, 7871741290, 1985905883, 929088783, 6201618260] 
@@ -34,6 +97,10 @@ user_watermark_text = {}
 # Key: chat_id (str), Value: count of images in current batch
 user_photo_count = {}
 user_photo_timers = {}
+
+# Per-user quality preference (default: "document" for high-quality document, "photo" for compressed photo)
+# Key: user_id (int), Value: "document" / "photo"
+user_quality_settings = {}
 
 # =========================================================
 # 3. ADVANCED IMAGE PROCESSING (DIAGONAL WATERMARK & RAM OPTIMIZED)
@@ -171,10 +238,12 @@ def send_welcome(message):
         return
 
     welcome_text = (
-        "🤖 **Eldorado Listing Bot (Cloud Optimized) is Online!**\n\n"
+        "🤖 **Galley-La Bot is Online!**\n\n"
         "1. Send screenshots.\n"
         "2. Type /generate to build a collage.\n"
-        "3. Use /watermark to toggle watermark settings."
+        "3. Use /clear to discard uploaded photos and start over.\n"
+        "4. Use /watermark to toggle watermark settings.\n"
+        "5. Use /quality to choose between high-quality document and fast photo output."
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode='Markdown')
 
@@ -238,9 +307,55 @@ def toggle_watermark(message):
         reply_markup=markup
     )
 
-@bot.callback_query_handler(func=lambda call: call.data in ['wm_on', 'wm_off', 'wm_text'])
-def handle_watermark_toggle(call):
-    """Handles the inline button press for watermark toggle."""
+@bot.message_handler(commands=['quality'])
+def toggle_quality(message):
+    """Lets the user toggle between Document (high quality) and Photo (compressed) output."""
+    if message.from_user.id not in ALLOWED_USERS: return
+
+    user_id = message.from_user.id
+    current = user_quality_settings.get(user_id, "document")
+    status = "📄 Document (High Quality)" if current == "document" else "🖼️ Photo (Compressed/Fast)"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📄 Document", callback_data="q_document"),
+        types.InlineKeyboardButton("🖼️ Photo", callback_data="q_photo")
+    )
+    bot.send_message(
+        message.chat.id,
+        f"⚡ **Image Quality & Format Settings**\n\nCurrent mode: {status}\n\nChoose how you want the bot to send your collage:",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+@bot.message_handler(commands=['clear'])
+def clear_session(message):
+    """Clears the currently uploaded photos and resets the session."""
+    if message.from_user.id not in ALLOWED_USERS: return
+
+    user_id = str(message.chat.id)
+    user_folder = os.path.join(TEMP_DIR, user_id)
+
+    # Cancel any active batch timers
+    if user_id in user_photo_timers:
+        try:
+            user_photo_timers[user_id].cancel()
+        except: pass
+        user_photo_timers.pop(user_id, None)
+    
+    user_photo_count.pop(user_id, None)
+
+    if os.path.exists(user_folder):
+        if safe_delete_folder(user_folder):
+            bot.reply_to(message, "🗑️ Your uploaded photos have been cleared. You can start sending new ones.")
+        else:
+            bot.reply_to(message, "❌ Failed to clear photos. Some files may be temporarily locked by the operating system.")
+    else:
+        bot.reply_to(message, "🤷 No photos found to clear.")
+
+@bot.callback_query_handler(func=lambda call: call.data in ['wm_on', 'wm_off', 'wm_text', 'q_document', 'q_photo'])
+def handle_callback_query(call):
+    """Handles all inline button clicks for watermark and quality settings."""
     if call.from_user.id not in ALLOWED_USERS:
         bot.answer_callback_query(call.id, "⛔ Denied.")
         return
@@ -271,6 +386,22 @@ def handle_watermark_toggle(call):
         )
         bot.register_next_step_handler(msg, receive_custom_watermark_text)
         bot.answer_callback_query(call.id, "Enter your custom text ✏️")
+    elif call.data == "q_document":
+        user_quality_settings[user_id] = "document"
+        bot.edit_message_text(
+            "⚡ **Image Quality & Format Settings**\n\nCurrent mode: 📄 Document (High Quality)\n\n_Collages will be sent as uncompressed files to keep maximum detail._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Saved: Document mode 📄")
+    elif call.data == "q_photo":
+        user_quality_settings[user_id] = "photo"
+        bot.edit_message_text(
+            "⚡ **Image Quality & Format Settings**\n\nCurrent mode: 🖼️ Photo (Compressed/Fast)\n\n_Collages will be sent as standard images for quick in-chat previews and easy sharing._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Saved: Photo mode 🖼️")
 
 def receive_custom_watermark_text(message):
     """Captures the user's custom watermark text from the next message."""
@@ -305,38 +436,72 @@ def process_listing(message):
         bot.reply_to(message, "Send photos first, then /generate.")
         return
 
-    m = bot.send_message(message.chat.id, "⚙️ Building memory-safe collage...")
+    # Count the photos in the user's folder
+    image_files = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    num_images = len(image_files)
+
+    caption_text = f"⚙️ Building collage from {num_images} images..."
+    loading_gif = "https://www.gifcen.com/wp-content/uploads/2022/11/one-piece-gif-1.gif" # One Piece loading spinner
+
+    # Send the loading animation (or fallback to message)
+    try:
+        m = bot.send_animation(message.chat.id, loading_gif, caption=caption_text)
+    except Exception:
+        m = bot.send_message(message.chat.id, caption_text)
 
     try:
         watermark_on = user_watermark_settings.get(message.from_user.id, True)
         wm_text = user_watermark_text.get(message.from_user.id, "Galley-La")
         collage_result = create_collage(user_folder, collage_path, watermark_enabled=watermark_on, watermark_text=wm_text)
         if not collage_result:
-            bot.edit_message_text("Error building collage.", m.chat.id, m.message_id)
+            try:
+                bot.delete_message(m.chat.id, m.message_id)
+            except: pass
+            bot.send_message(message.chat.id, "Error building collage.")
             return
             
         _, final_path = collage_result
         
-        # Free up 'm' message to prevent chat clutter
-        bot.delete_message(m.chat.id, m.message_id)
+        # Free up loading message to prevent chat clutter
+        try:
+            bot.delete_message(m.chat.id, m.message_id)
+        except: pass
 
-       # Send as an uncompressed document to maintain maximum quality
+        # Send collage based on user's format preference
+        quality_pref = user_quality_settings.get(message.from_user.id, "document")
+        wm_label = "watermarked " if watermark_on else ""
+
         with open(final_path, 'rb') as file_data:
-            wm_label = "watermarked " if user_watermark_settings.get(message.from_user.id, True) else ""
-            bot.send_document(message.chat.id, file_data, caption=f"Here's your high-quality {wm_label}image!", visible_file_name="Galley_La_Collage.jpg")
+            if quality_pref == "photo":
+                bot.send_photo(
+                    message.chat.id,
+                    file_data,
+                    caption=f"Here's your {wm_label}collage!"
+                )
+            else:
+                bot.send_document(
+                    message.chat.id,
+                    file_data,
+                    caption=f"Here's your high-quality {wm_label}image!",
+                    visible_file_name="Galley_La_Collage.jpg"
+                )
 
     except Exception as e:
         bot.reply_to(message, f"An error occurred: {str(e)}")
+        # Delete the loading message if it was sent
+        try:
+            bot.delete_message(m.chat.id, m.message_id)
+        except: pass
         # Safe Cleanup on collage failure
         try:
             if os.path.exists(user_folder):
-                shutil.rmtree(user_folder)
+                safe_delete_folder(user_folder)
         except: pass
 
     # CLOUD FIX: Safe Cleanup prevents random Windows permissions/ghost errors from locking folders
     try:
         if os.path.exists(user_folder):
-            shutil.rmtree(user_folder)
+            safe_delete_folder(user_folder)
     except Exception as e:
         # Prints to Koyeb console, does not notify user
         print(f"[*] Cleanup warning for {user_id}: {e}")
@@ -374,7 +539,7 @@ if __name__ == "__main__":
     # Start the keep-awake web server
     keep_awake()
     
-    print("[*] Eldorado Bot is securely running... Press Ctrl+C to stop.")
+    print("[*] Galley-La Bot is securely running... Press Ctrl+C to stop.")
     
     # ADVANCED FIX: Sever any ghost connections from previous deployments
     bot.remove_webhook() 
