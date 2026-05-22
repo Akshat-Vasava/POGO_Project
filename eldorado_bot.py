@@ -5,8 +5,7 @@ import json
 import telebot
 from telebot import types, apihelper
 from PIL import Image, ImageDraw, ImageFont
-from flask import Flask
-from threading import Thread, Timer
+from threading import Timer
 import time
 import stat
 
@@ -64,7 +63,7 @@ def safe_delete_folder(folder_path):
 # =========================================================
 # 1. CONFIGURATION & ACCESS CONTROL (CLOUD-SECURE)
 # =========================================================
-# Remember to set these on Koyeb, NOT in the code!
+# Remember to set these on Azure, NOT in the code!
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 # Fallback: Parse local .env file if running locally without the environment variable set
@@ -81,7 +80,8 @@ if not TELEGRAM_BOT_TOKEN:
                         break
 
 # Hardcode your authorized numeric IDs here
-ALLOWED_USERS = [5282482434, 7871741290, 1985905883, 929088783, 6201618260] 
+ADMIN_USERS = [5282482434] 
+FREE_TRIAL_COLLAGES = 5
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
@@ -128,6 +128,191 @@ user_quality_settings = {}
 # Key: user_id (int), Value: "auto" / "vertical" / "horizontal" / "grid"
 user_layout_settings = {}
 
+# Per-user collage counts and premium status
+# Key: user_id (int)
+user_collage_count = {}
+premium_users = {}
+
+# =========================================================
+# DATABASE INTEGRATION (MONGODB ATLAS)
+# =========================================================
+MONGO_URI = os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URI")
+
+# Fallback: Parse local .env file if running locally without the environment variable set
+if not MONGO_URI:
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    if key.strip() in ("MONGO_URI", "MONGODB_URI"):
+                        MONGO_URI = value.strip().strip("'").strip('"')
+                        os.environ["MONGO_URI"] = MONGO_URI
+                        break
+
+# Initialize MongoDB client if URI is provided
+db = None
+users_col = None
+
+if MONGO_URI:
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Force a connection check to make sure Atlas is alive
+        client.server_info()
+        db = client["eldorado_bot"]
+        users_col = db["users"]
+        print("[*] Successfully connected to MongoDB Atlas!")
+    except Exception as e:
+        print(f"[*] Warning: Could not connect to MongoDB: {e}. Falling back to local JSON persistence.")
+        db = None
+        users_col = None
+else:
+    print("[*] No MongoDB URI specified. Falling back to local JSON persistence.")
+
+def get_user_data(user_id):
+    """Loads all settings for a user. Returns a dictionary with all user settings.
+    If MongoDB is connected, loads from MongoDB. Otherwise, falls back to the in-memory dict cache.
+    """
+    u_id = int(user_id)
+    
+    if users_col is not None:
+        try:
+            doc = users_col.find_one({"_id": u_id})
+            if doc:
+                return {
+                    "watermark_enabled": doc.get("watermark_enabled", True),
+                    "watermark_text": doc.get("watermark_text", "Galley-La"),
+                    "watermark_color": doc.get("watermark_color", "black"),
+                    "quality": doc.get("quality", "document"),
+                    "layout": doc.get("layout", "auto"),
+                    "collage_count": doc.get("collage_count", 0),
+                    "is_premium": doc.get("is_premium", False)
+                }
+        except Exception as e:
+            print(f"[*] MongoDB error in get_user_data: {e}")
+            
+    # Fallback to in-memory dictionaries
+    return {
+        "watermark_enabled": user_watermark_settings.get(u_id, True),
+        "watermark_text": user_watermark_text.get(u_id, "Galley-La"),
+        "watermark_color": user_watermark_colors.get(u_id, "black"),
+        "quality": user_quality_settings.get(u_id, "document"),
+        "layout": user_layout_settings.get(u_id, "auto"),
+        "collage_count": user_collage_count.get(u_id, 0),
+        "is_premium": premium_users.get(u_id, False)
+    }
+
+def set_user_data(user_id, update_dict):
+    """Updates settings for a user.
+    If MongoDB is connected, writes to MongoDB. Otherwise, writes to the in-memory cache and saves to local JSON.
+    """
+    u_id = int(user_id)
+    
+    if users_col is not None:
+        try:
+            mongo_update = {}
+            for k, v in update_dict.items():
+                if k == "watermark_enabled": mongo_update["watermark_enabled"] = v
+                elif k == "watermark_text": mongo_update["watermark_text"] = v
+                elif k == "watermark_color": mongo_update["watermark_color"] = v
+                elif k == "quality": mongo_update["quality"] = v
+                elif k == "layout": mongo_update["layout"] = v
+                elif k == "collage_count": mongo_update["collage_count"] = v
+                elif k == "is_premium": mongo_update["is_premium"] = v
+                
+            if mongo_update:
+                users_col.update_one({"_id": u_id}, {"$set": mongo_update}, upsert=True)
+                return True
+        except Exception as e:
+            print(f"[*] MongoDB error in set_user_data: {e}")
+            
+    # Fallback to in-memory dictionaries and save to local JSON
+    for k, v in update_dict.items():
+        if k == "watermark_enabled": user_watermark_settings[u_id] = v
+        elif k == "watermark_text": user_watermark_text[u_id] = v
+        elif k == "watermark_color": user_watermark_colors[u_id] = v
+        elif k == "quality": user_quality_settings[u_id] = v
+        elif k == "layout": user_layout_settings[u_id] = v
+        elif k == "collage_count": user_collage_count[u_id] = v
+        elif k == "is_premium": premium_users[u_id] = v
+        
+    save_user_settings()
+    return True
+
+def migrate_local_to_mongodb():
+    """Migrates existing user settings from user_settings.json to MongoDB if MongoDB is empty."""
+    if users_col is None:
+        return
+    try:
+        if users_col.count_documents({}) > 0:
+            return
+            
+        print("[*] MongoDB is empty. Checking for local settings to migrate...")
+        if not os.path.exists(SETTINGS_FILE):
+            return
+            
+        load_user_settings()
+        
+        all_user_ids = set()
+        all_user_ids.update(user_watermark_settings.keys())
+        all_user_ids.update(user_watermark_text.keys())
+        all_user_ids.update(user_watermark_colors.keys())
+        all_user_ids.update(user_quality_settings.keys())
+        all_user_ids.update(user_layout_settings.keys())
+        all_user_ids.update(user_collage_count.keys())
+        all_user_ids.update(premium_users.keys())
+        
+        if not all_user_ids:
+            return
+            
+        print(f"[*] Found {len(all_user_ids)} users locally. Migrating to MongoDB...")
+        
+        bulk_docs = []
+        for u_id in all_user_ids:
+            doc = {
+                "_id": int(u_id),
+                "watermark_enabled": user_watermark_settings.get(u_id, True),
+                "watermark_text": user_watermark_text.get(u_id, "Galley-La"),
+                "watermark_color": user_watermark_colors.get(u_id, "black"),
+                "quality": user_quality_settings.get(u_id, "document"),
+                "layout": user_layout_settings.get(u_id, "auto"),
+                "collage_count": user_collage_count.get(u_id, 0),
+                "is_premium": premium_users.get(u_id, False)
+            }
+            bulk_docs.append(doc)
+            
+        if bulk_docs:
+            users_col.insert_many(bulk_docs)
+            print(f"[*] Successfully migrated {len(bulk_docs)} users to MongoDB!")
+    except Exception as e:
+        print(f"[*] Error during local-to-MongoDB migration: {e}")
+
+def check_user_access(user_id):
+    """Returns (allowed, reason) tuple.
+    - Admins: always allowed
+    - Premium users: always allowed
+    - Trial users: allowed if collage_count < FREE_TRIAL_COLLAGES
+    - Exhausted trial: denied with message
+    """
+    try:
+        u_id = int(user_id)
+    except (ValueError, TypeError):
+        return False, "invalid_id"
+
+    if u_id in ADMIN_USERS:
+        return True, "admin"
+        
+    user_data = get_user_data(u_id)
+    if user_data["is_premium"]:
+        return True, "premium"
+    
+    count = user_data["collage_count"]
+    if count < FREE_TRIAL_COLLAGES:
+        return True, "trial"
+    return False, "expired"
+
 # =========================================================
 # 2. SETTINGS PERSISTENCE (Survive Restarts)
 # =========================================================
@@ -139,6 +324,8 @@ def save_user_settings():
         "watermark_colors": {str(k): v for k, v in user_watermark_colors.items()},
         "quality_settings": {str(k): v for k, v in user_quality_settings.items()},
         "layout_settings": {str(k): v for k, v in user_layout_settings.items()},
+        "collage_count": {str(k): v for k, v in user_collage_count.items()},
+        "premium_users": {str(k): v for k, v in premium_users.items()},
     }
     try:
         with open(SETTINGS_FILE, "w") as f:
@@ -150,6 +337,7 @@ def load_user_settings():
     """Loads all user preferences from the JSON file on startup."""
     global user_watermark_settings, user_watermark_text, user_watermark_colors
     global user_quality_settings, user_layout_settings
+    global user_collage_count, premium_users
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -161,6 +349,8 @@ def load_user_settings():
         user_watermark_colors = {int(k): v for k, v in data.get("watermark_colors", {}).items()}
         user_quality_settings = {int(k): v for k, v in data.get("quality_settings", {}).items()}
         user_layout_settings = {int(k): v for k, v in data.get("layout_settings", {}).items()}
+        user_collage_count = {int(k): v for k, v in data.get("collage_count", {}).items()}
+        premium_users = {int(k): v for k, v in data.get("premium_users", {}).items()}
         print(f"[*] Loaded user settings for {len(user_watermark_settings)} user(s).")
     except Exception as e:
         print(f"[*] Warning: Could not load user settings: {e}")
@@ -223,7 +413,7 @@ def apply_watermark(image, store_name="Galley-La", color_rgba=(0, 0, 0, 100)):
 
 def create_collage(image_folder, output_path, watermark_enabled=True, watermark_text="Galley-La", layout_style="auto", watermark_color="black"):
     """Builds a seamless masonry collage with no black backgrounds."""
-    image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != "final_collage.jpg"]
+    image_files = [f for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and f != "final_collage.jpg"]
     if not image_files: return None
 
     # Load images
@@ -340,42 +530,58 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
 # =========================================================
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, f"⛔ Access Denied. Your numeric Telegram ID is: {message.from_user.id}")
-        return
-
+    user_id = message.from_user.id
     user_name = message.from_user.first_name or "Nakama"
+    
+    # Check access status to customize greeting
+    allowed, reason = check_user_access(user_id)
+    status_text = ""
+    if reason == "admin":
+        status_text = "⭐ **Status**: Admin Access (Unlimited)"
+    elif reason == "premium":
+        status_text = "👑 **Status**: Premium User (Unlimited)"
+    elif reason == "trial":
+        user_data = get_user_data(user_id)
+        count = user_data["collage_count"]
+        remaining = FREE_TRIAL_COLLAGES - count
+        status_text = f"🎁 **Status**: Free Trial ({remaining}/{FREE_TRIAL_COLLAGES} collages remaining)"
+    else:
+        status_text = "❌ **Status**: Free Trial Used Up. Contact admin [@Ak\\_210606](https://t.me/Ak_210606) for Premium!"
+
     welcome_text = (
         f"🏴‍☠️ **Welcome aboard, {user_name}!**\n\n"
         "I'm the *Galley-La Bot* — your personal collage builder! 🛠️\n\n"
         "Just send me your screenshots and I'll stitch them into a clean, "
         "professional collage with watermarks, custom layouts, and more.\n\n"
-        "Ready to set sail? 📸 Send your first photos!\n\n"
+        f"{status_text}\n\n"
+        "Ready to set sail? 📸 Send your first photos!\n"
+        "📎 _Send images as Files for maximum 4K HD quality._\n\n"
         "💡 _Type /help anytime to see all available commands._"
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['help'])
 def send_help(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, f"⛔ Access Denied. Your numeric Telegram ID is: {message.from_user.id}")
-        return
-
     help_text = (
         "📖 **Command Reference**\n\n"
         "📸 *Send photos* — Upload screenshots to the bot.\n"
+        "📎 *Send as File* — Send images as documents for maximum 4K HD quality.\n"
         "⚙️ /generate — Build a collage from your uploaded photos.\n"
         "🗑️ /clear — Discard uploaded photos and start over.\n"
         "🔖 /watermark — Toggle watermark on/off, set custom text & color.\n"
         "⚡ /quality — Choose between high-quality document or fast photo output.\n"
-        "📐 /layout — Pick collage layout style (Auto, Grid, Vertical, Horizontal).\n\n"
+        "📐 /layout — Pick collage layout style (Auto, Grid, Vertical, Horizontal).\n"
+        "📊 /mystatus — Check your plan status & remaining free trials.\n\n"
         f"📌 _Photo limit: {MAX_PHOTOS_PER_SESSION} images per session._"
     )
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
 
 @bot.message_handler(content_types=['photo'])
 def handle_photos(message):
-    if message.from_user.id not in ALLOWED_USERS: return
+    allowed, reason = check_user_access(message.from_user.id)
+    if not allowed:
+        bot.reply_to(message, "⭐ Your 5 free trial collages are used up! Contact admin [@Ak\\_210606](https://t.me/Ak_210606) to get Premium access.", parse_mode='Markdown')
+        return
     
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
@@ -383,7 +589,7 @@ def handle_photos(message):
     os.makedirs(user_folder, exist_ok=True)
 
     # Enforce photo upload limit to prevent RAM exhaustion
-    existing_photos = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != "final_collage.jpg"]
+    existing_photos = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and f != "final_collage.jpg"]
     if len(existing_photos) >= MAX_PHOTOS_PER_SESSION:
         bot.reply_to(message, f"⚠️ Maximum limit of {MAX_PHOTOS_PER_SESSION} photos reached! Use /generate to build your collage or /clear to start over.")
         return
@@ -429,15 +635,83 @@ def handle_photos(message):
     user_photo_timers[user_id] = timer
     timer.start()
 
+@bot.message_handler(content_types=['document'])
+def handle_document_photos(message):
+    """Accept images sent as files/documents for full 4K HD quality."""
+    allowed, reason = check_user_access(message.from_user.id)
+    if not allowed:
+        bot.reply_to(message, "⭐ Your 5 free trial collages are used up! Contact admin [@Ak\\_210606](https://t.me/Ak_210606) to get Premium access.", parse_mode='Markdown')
+        return
+
+    doc = message.document
+    if not doc or not doc.mime_type or not doc.mime_type.startswith('image/'):
+        return  # Silently ignore non-image documents
+
+    user_id = str(message.chat.id)
+    user_folder = os.path.join(TEMP_DIR, user_id)
+    os.makedirs(user_folder, exist_ok=True)
+
+    # Enforce photo upload limit to prevent RAM exhaustion
+    existing_photos = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and f != "final_collage.jpg"]
+    if len(existing_photos) >= MAX_PHOTOS_PER_SESSION:
+        bot.reply_to(message, f"⚠️ Maximum limit of {MAX_PHOTOS_PER_SESSION} photos reached! Use /generate to build your collage or /clear to start over.")
+        return
+
+    file_info = bot.get_file(doc.file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+
+    # Determine file extension from the original filename or mime type
+    original_name = doc.file_name or ""
+    ext = os.path.splitext(original_name)[1].lower()
+    if ext not in ('.png', '.jpg', '.jpeg', '.webp'):
+        ext = '.jpg'  # Default fallback
+
+    file_path = os.path.join(user_folder, f"{doc.file_id}{ext}")
+    with open(file_path, 'wb') as new_file:
+        new_file.write(downloaded_file)
+
+    # Increment photo count for this user (shares batch tracking with photo handler)
+    user_photo_count[user_id] = user_photo_count.get(user_id, 0) + 1
+
+    # Send an instant "Receiving images..." message on the first image of a batch
+    if user_photo_count[user_id] == 1:
+        try:
+            receiving_msg = bot.send_message(message.chat.id, "📥 _Receiving HD images..._", parse_mode='Markdown')
+            user_photo_receiving_msg[user_id] = receiving_msg
+        except Exception:
+            pass
+
+    # Cancel any existing timer for this user (debounce)
+    if user_id in user_photo_timers:
+        user_photo_timers[user_id].cancel()
+
+    # Start a new 2-second timer; fires only after user stops sending
+    chat_id = message.chat.id
+    def send_batch_reply():
+        count = user_photo_count.pop(user_id, 0)
+        user_photo_timers.pop(user_id, None)
+        # Delete the "Receiving images..." message
+        receiving_msg = user_photo_receiving_msg.pop(user_id, None)
+        if receiving_msg:
+            try:
+                bot.delete_message(receiving_msg.chat.id, receiving_msg.message_id)
+            except Exception:
+                pass
+        if count > 0:
+            bot.send_message(chat_id, f"📸 {count} HD Images received! Send more, or type /generate.")
+
+    timer = Timer(2.0, send_batch_reply)
+    user_photo_timers[user_id] = timer
+    timer.start()
+
 @bot.message_handler(commands=['watermark'])
 def toggle_watermark(message):
     """Lets the user turn watermark on or off via inline buttons."""
-    if message.from_user.id not in ALLOWED_USERS: return
-
     user_id = message.from_user.id
-    current = user_watermark_settings.get(user_id, True)
-    current_text = user_watermark_text.get(user_id, "Galley-La")
-    current_color_key = user_watermark_colors.get(user_id, "black")
+    user_data = get_user_data(user_id)
+    current = user_data["watermark_enabled"]
+    current_text = user_data["watermark_text"]
+    current_color_key = user_data["watermark_color"]
     color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
     current_color_name = color_info["name"]
     status = "✅ ON" if current else "❌ OFF"
@@ -461,10 +735,9 @@ def toggle_watermark(message):
 @bot.message_handler(commands=['quality'])
 def toggle_quality(message):
     """Lets the user toggle between Document (high quality) and Photo (compressed) output."""
-    if message.from_user.id not in ALLOWED_USERS: return
-
     user_id = message.from_user.id
-    current = user_quality_settings.get(user_id, "document")
+    user_data = get_user_data(user_id)
+    current = user_data["quality"]
     status = "📄 Document (High Quality)" if current == "document" else "🖼️ Photo (Compressed/Fast)"
 
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -482,8 +755,6 @@ def toggle_quality(message):
 @bot.message_handler(commands=['clear'])
 def clear_session(message):
     """Clears the currently uploaded photos and resets the session."""
-    if message.from_user.id not in ALLOWED_USERS: return
-
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
 
@@ -507,10 +778,9 @@ def clear_session(message):
 @bot.message_handler(commands=['layout'])
 def toggle_layout(message):
     """Lets the user choose their collage layout style via inline buttons."""
-    if message.from_user.id not in ALLOWED_USERS: return
-
     user_id = message.from_user.id
-    current = user_layout_settings.get(user_id, "auto")
+    user_data = get_user_data(user_id)
+    current = user_data["layout"]
     
     style_names = {
         "auto": "🤖 Auto (Default)",
@@ -543,19 +813,13 @@ def toggle_layout(message):
     'q_document', 'q_photo',
     'l_auto', 'l_grid', 'l_vertical', 'l_horizontal'
 ])
-def handle_callback_query(call):
-    """Handles all inline button clicks for watermark, quality, and layout settings."""
-    if call.from_user.id not in ALLOWED_USERS:
-        bot.answer_callback_query(call.id, "⛔ Denied.")
-        return
-
+def callback_handler(call):
     user_id = call.from_user.id
-
     if call.data == "wm_on":
-        user_watermark_settings[user_id] = True
-        save_user_settings()
-        current_text = user_watermark_text.get(user_id, "Galley-La")
-        current_color_key = user_watermark_colors.get(user_id, "black")
+        set_user_data(user_id, {"watermark_enabled": True})
+        user_data = get_user_data(user_id)
+        current_text = user_data["watermark_text"]
+        current_color_key = user_data["watermark_color"]
         color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
         current_color_name = color_info["name"]
         bot.edit_message_text(
@@ -565,10 +829,10 @@ def handle_callback_query(call):
         )
         bot.answer_callback_query(call.id, "Watermark turned ON ✅")
     elif call.data == "wm_off":
-        user_watermark_settings[user_id] = False
-        save_user_settings()
-        current_text = user_watermark_text.get(user_id, "Galley-La")
-        current_color_key = user_watermark_colors.get(user_id, "black")
+        set_user_data(user_id, {"watermark_enabled": False})
+        user_data = get_user_data(user_id)
+        current_text = user_data["watermark_text"]
+        current_color_key = user_data["watermark_color"]
         color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
         current_color_name = color_info["name"]
         bot.edit_message_text(
@@ -591,7 +855,8 @@ def handle_callback_query(call):
             types.InlineKeyboardButton("⬅️ Back", callback_data="wm_back")
         )
         
-        current_color_key = user_watermark_colors.get(user_id, "black")
+        user_data = get_user_data(user_id)
+        current_color_key = user_data["watermark_color"]
         color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
         current_color_name = color_info["name"]
         
@@ -603,9 +868,10 @@ def handle_callback_query(call):
         )
         bot.answer_callback_query(call.id)
     elif call.data == "wm_back":
-        current = user_watermark_settings.get(user_id, True)
-        current_text = user_watermark_text.get(user_id, "Galley-La")
-        current_color_key = user_watermark_colors.get(user_id, "black")
+        user_data = get_user_data(user_id)
+        current = user_data["watermark_enabled"]
+        current_text = user_data["watermark_text"]
+        current_color_key = user_data["watermark_color"]
         color_info = WATERMARK_COLORS.get(current_color_key, WATERMARK_COLORS["black"])
         current_color_name = color_info["name"]
         status = "✅ ON" if current else "❌ OFF"
@@ -628,8 +894,7 @@ def handle_callback_query(call):
         bot.answer_callback_query(call.id)
     elif call.data.startswith("wmc_"):
         color_key = call.data.split("_")[1]
-        user_watermark_colors[user_id] = color_key
-        save_user_settings()
+        set_user_data(user_id, {"watermark_color": color_key})
         
         color_info = WATERMARK_COLORS.get(color_key, WATERMARK_COLORS["black"])
         color_name = color_info["name"]
@@ -662,8 +927,7 @@ def handle_callback_query(call):
         bot.register_next_step_handler(msg, receive_custom_watermark_text)
         bot.answer_callback_query(call.id, "Enter your custom text ✏️")
     elif call.data == "q_document":
-        user_quality_settings[user_id] = "document"
-        save_user_settings()
+        set_user_data(user_id, {"quality": "document"})
         bot.edit_message_text(
             "⚡ **Image Quality & Format Settings**\n\nCurrent mode: 📄 Document (High Quality)\n\n_Collages will be sent as uncompressed files to keep maximum detail._",
             call.message.chat.id, call.message.message_id,
@@ -671,8 +935,7 @@ def handle_callback_query(call):
         )
         bot.answer_callback_query(call.id, "Saved: Document mode 📄")
     elif call.data == "q_photo":
-        user_quality_settings[user_id] = "photo"
-        save_user_settings()
+        set_user_data(user_id, {"quality": "photo"})
         bot.edit_message_text(
             "⚡ **Image Quality & Format Settings**\n\nCurrent mode: 🖼️ Photo (Compressed/Fast)\n\n_Collages will be sent as standard images for quick in-chat previews and easy sharing._",
             call.message.chat.id, call.message.message_id,
@@ -680,8 +943,7 @@ def handle_callback_query(call):
         )
         bot.answer_callback_query(call.id, "Saved: Photo mode 🖼️")
     elif call.data == "l_auto":
-        user_layout_settings[user_id] = "auto"
-        save_user_settings()
+        set_user_data(user_id, {"layout": "auto"})
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: 🤖 Auto (Default)\n\n_The bot will dynamically pick the best layout for your screenshots._",
             call.message.chat.id, call.message.message_id,
@@ -689,8 +951,7 @@ def handle_callback_query(call):
         )
         bot.answer_callback_query(call.id, "Saved: Auto layout 🤖")
     elif call.data == "l_grid":
-        user_layout_settings[user_id] = "grid"
-        save_user_settings()
+        set_user_data(user_id, {"layout": "grid"})
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: 🔲 Balanced Grid\n\n_Images will be distributed evenly in a grid (e.g. 2x2, 3x3)._",
             call.message.chat.id, call.message.message_id,
@@ -698,8 +959,7 @@ def handle_callback_query(call):
         )
         bot.answer_callback_query(call.id, "Saved: Balanced Grid 🔲")
     elif call.data == "l_vertical":
-        user_layout_settings[user_id] = "vertical"
-        save_user_settings()
+        set_user_data(user_id, {"layout": "vertical"})
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: ↕️ Single Column (Vertical)\n\n_Every image will be placed in a single row stacked vertically._",
             call.message.chat.id, call.message.message_id,
@@ -707,8 +967,7 @@ def handle_callback_query(call):
         )
         bot.answer_callback_query(call.id, "Saved: Vertical Column ↕️")
     elif call.data == "l_horizontal":
-        user_layout_settings[user_id] = "horizontal"
-        save_user_settings()
+        set_user_data(user_id, {"layout": "horizontal"})
         bot.edit_message_text(
             "📐 **Collage Layout Settings**\n\nCurrent style: ↔️ Single Row (Horizontal)\n\n_All images will be placed next to each other in a single horizontal row._",
             call.message.chat.id, call.message.message_id,
@@ -718,8 +977,6 @@ def handle_callback_query(call):
 
 def receive_custom_watermark_text(message):
     """Captures the user's custom watermark text from the next message."""
-    if message.from_user.id not in ALLOWED_USERS: return
-
     user_id = message.from_user.id
     custom_text = message.text.strip() if message.text else None
 
@@ -727,10 +984,7 @@ def receive_custom_watermark_text(message):
         bot.reply_to(message, "❌ Invalid input. Please use /watermark and try again.")
         return
 
-    user_watermark_text[user_id] = custom_text
-    # Also auto-enable watermark when setting custom text
-    user_watermark_settings[user_id] = True
-    save_user_settings()
+    set_user_data(user_id, {"watermark_text": custom_text, "watermark_enabled": True})
     bot.reply_to(
         message,
         f"✅ Custom watermark set to: `{custom_text}`\n\n_Watermark has been turned ON automatically._",
@@ -739,7 +993,11 @@ def receive_custom_watermark_text(message):
 
 @bot.message_handler(commands=['generate'])
 def process_listing(message):
-    if message.from_user.id not in ALLOWED_USERS: return
+    user_id_int = message.from_user.id
+    allowed, reason = check_user_access(user_id_int)
+    if not allowed:
+        bot.reply_to(message, "⭐ Your 5 free trial collages are used up! Contact admin [@Ak\\_210606](https://t.me/Ak_210606) to get Premium access.", parse_mode='Markdown')
+        return
 
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
@@ -751,7 +1009,7 @@ def process_listing(message):
         return
 
     # Count the photos in the user's folder (exclude any previously generated collage)
-    image_files = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != "final_collage.jpg"]
+    image_files = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and f != "final_collage.jpg"]
     num_images = len(image_files)
 
     caption_text = f"⚙️ Building collage from {num_images} images..."
@@ -764,10 +1022,11 @@ def process_listing(message):
         m = bot.send_message(message.chat.id, caption_text)
 
     try:
-        watermark_on = user_watermark_settings.get(message.from_user.id, True)
-        wm_text = user_watermark_text.get(message.from_user.id, "Galley-La")
-        layout_pref = user_layout_settings.get(message.from_user.id, "auto")
-        wm_color = user_watermark_colors.get(message.from_user.id, "black")
+        user_data = get_user_data(message.from_user.id)
+        watermark_on = user_data["watermark_enabled"]
+        wm_text = user_data["watermark_text"]
+        layout_pref = user_data["layout"]
+        wm_color = user_data["watermark_color"]
         collage_result = create_collage(
             user_folder, 
             collage_path, 
@@ -786,7 +1045,7 @@ def process_listing(message):
         _, final_path = collage_result
         
         # Send collage based on user's format preference
-        quality_pref = user_quality_settings.get(message.from_user.id, "document")
+        quality_pref = user_data["quality"]
         wm_label = "watermarked " if watermark_on else ""
 
         with open(final_path, 'rb') as file_data:
@@ -811,6 +1070,16 @@ def process_listing(message):
             bot.delete_message(m.chat.id, m.message_id)
         except: pass
 
+        # Increment user's collage count and save settings
+        u_id = message.from_user.id
+        new_count = user_data["collage_count"] + 1
+        set_user_data(u_id, {"collage_count": new_count})
+
+        # Notify user of remaining trials if they are in trial mode
+        if u_id not in ADMIN_USERS and not user_data["is_premium"]:
+            remaining = max(0, FREE_TRIAL_COLLAGES - new_count)
+            bot.send_message(message.chat.id, f"🎁 Trial Update: You have {remaining}/{FREE_TRIAL_COLLAGES} free trial collages remaining.")
+
     except Exception as e:
         bot.reply_to(message, f"An error occurred: {str(e)}")
         # Delete the loading message if it was sent
@@ -829,44 +1098,107 @@ def process_listing(message):
         if os.path.exists(user_folder):
             safe_delete_folder(user_folder)
     except Exception as e:
-        # Prints to Koyeb console, does not notify user
+        # Prints to console, does not notify user
         print(f"[*] Cleanup warning for {user_id}: {e}")
     
     bot.send_message(message.chat.id, "✅ Session cleared.")
 
+@bot.message_handler(commands=['mystatus'])
+def my_status(message):
+    """Shows user their current plan status and remaining collages."""
+    user_id = message.from_user.id
+    user_name = message.from_user.first_name or "Nakama"
+    
+    allowed, reason = check_user_access(user_id)
+    user_data = get_user_data(user_id)
+    
+    if reason == "admin":
+        msg = f"⭐ **Status for {user_name}**:\n👑 **Plan**: Admin (Unlimited Access)"
+    elif reason == "premium":
+        msg = f"👑 **Status for {user_name}**:\n✨ **Plan**: Premium (Unlimited Access)"
+    elif reason == "trial":
+        count = user_data["collage_count"]
+        remaining = FREE_TRIAL_COLLAGES - count
+        msg = (
+            f"🎁 **Status for {user_name}**:\n"
+            f"✨ **Plan**: Free Trial\n"
+            f"📊 **Collages created**: {count}/{FREE_TRIAL_COLLAGES}\n"
+            f"🔑 **Remaining free trials**: {remaining}"
+        )
+    else:
+        msg = (
+            f"❌ **Status for {user_name}**:\n"
+            f"✨ **Plan**: Free Trial (Expired)\n"
+            f"📊 **Collages created**: {user_data['collage_count']}/{FREE_TRIAL_COLLAGES}\n\n"
+            f"⭐ Your trial has finished! Contact admin [@Ak\\_210606](https://t.me/Ak_210606) to get Premium access."
+        )
+        
+    bot.send_message(message.chat.id, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['premium', 'approve'])
+def manage_premium(message):
+    """Admin-only command to grant/revoke premium access."""
+    if message.from_user.id not in ADMIN_USERS:
+        return  # Silently ignore non-admin commands
+        
+    args = message.text.split()
+    cmd = args[0].lower().replace('/', '')
+    
+    # Check if revoke is requested
+    revoke = False
+    target_id_str = ""
+    
+    if len(args) >= 2:
+        if args[1].lower() == "revoke":
+            if len(args) < 3:
+                bot.reply_to(message, f"❌ Please specify a user ID: `/{cmd} revoke <user_id>`", parse_mode='Markdown')
+                return
+            revoke = True
+            target_id_str = args[2]
+        else:
+            target_id_str = args[1]
+    else:
+        bot.reply_to(
+            message, 
+            f"🔧 **Premium Management Console**\n\n"
+            f"Usage:\n"
+            f"• `/{cmd} <user_id>` — Grant premium\n"
+            f"• `/{cmd} revoke <user_id>` — Revoke premium",
+            parse_mode='Markdown'
+        )
+        return
+
+    try:
+        target_id = int(target_id_str)
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID. It must be a number.")
+        return
+
+    if revoke:
+        set_user_data(target_id, {"is_premium": False})
+        bot.reply_to(message, f"❌ Revoked premium status for user ID `{target_id}`.", parse_mode='Markdown')
+        try:
+            bot.send_message(target_id, "ℹ️ Your premium status has been revoked.")
+        except Exception:
+            pass
+    else:
+        set_user_data(target_id, {"is_premium": True})
+        bot.reply_to(message, f"👑 Granted premium status to user ID `{target_id}`.", parse_mode='Markdown')
+        try:
+            bot.send_message(target_id, "🎉 **Congratulations!** You have been granted **Premium Unlimited** access! Enjoy building collages!")
+        except Exception:
+            pass
+
 # =========================================================
-# 5. KOYEB KEEP-ALIVE SERVER (WEBSERVER FOR HEALTH CHECKS)
-# =========================================================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    # UptimeRobot checks this URL to prevent Koyeb sleep mode
-    return "Eldorado Bot is awake and running!"
-
-def run_server():
-    # Koyeb requires apps to bind to a specific port environment variable
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_awake():
-    # Run the web server in a background thread so the main bot isn't blocked
-    t = Thread(target=run_server)
-    t.daemon = True
-    t.start()
-
-# =========================================================
-# 6. EXECUTION
+# 5. EXECUTION
 # =========================================================
 if __name__ == "__main__":
-    # Ensure root temp directory exists on cloud start
+    # Ensure root temp directory exists on start
     if not os.path.exists(TEMP_DIR): os.makedirs(TEMP_DIR)
     
     # Load persisted user settings from previous sessions
     load_user_settings()
-    
-    # Start the keep-awake web server
-    keep_awake()
+    migrate_local_to_mongodb()
     
     print("[*] Galley-La Bot is securely running... Press Ctrl+C to stop.")
     
