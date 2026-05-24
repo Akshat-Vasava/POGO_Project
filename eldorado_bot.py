@@ -1193,9 +1193,12 @@ def manage_premium(message):
 # 5. EXECUTION
 # =========================================================
 if __name__ == "__main__":
-    # Ensure root temp directory exists on start
-    if not os.path.exists(TEMP_DIR): os.makedirs(TEMP_DIR)
+    import time
     
+    # Ensure root temp directory exists on start
+    if not os.path.exists(TEMP_DIR): 
+        os.makedirs(TEMP_DIR)
+        
     # Load persisted user settings from previous sessions
     load_user_settings()
     migrate_local_to_mongodb()
@@ -1203,5 +1206,13 @@ if __name__ == "__main__":
     print("[*] Galley-La Bot is securely running... Press Ctrl+C to stop.")
     
     # ADVANCED FIX: Sever any ghost connections from previous deployments
-    bot.remove_webhook() 
-    bot.infinity_polling()
+    bot.remove_webhook()
+    
+    # Infinite loop to handle hard network crashes automatically
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=5)
+        except Exception as e:
+            print(f"[!] Network error occurred: {e}")
+            print("[*] Reconnecting in 5 seconds...")
+            time.sleep(5)
