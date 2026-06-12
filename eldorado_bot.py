@@ -127,6 +127,39 @@ user_watermark_colors = {}
 user_photo_count = {}
 user_photo_timers = {}
 user_photo_receiving_msg = {}  # Tracks the "Receiving images..." message object per user for cleanup
+user_inactivity_timers = {}  # Tracks the 1-minute inactivity timer per user
+
+def start_inactivity_timer(user_id, chat_id):
+    """Starts a 60-second inactivity timer to auto-clear files."""
+    cancel_inactivity_timer(user_id)  # Cancel any existing timer first
+    
+    def auto_clear():
+        user_inactivity_timers.pop(user_id, None)
+        user_folder = os.path.join(TEMP_DIR, user_id)
+        if os.path.exists(user_folder):
+            try:
+                safe_delete_folder(user_folder)
+                bot.send_message(
+                    chat_id, 
+                    "⏰ *Session expired!*\nYour uploaded photos have been automatically cleared due to 1 minute of inactivity.", 
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                print(f"[*] Auto-clear error for {user_id}: {e}")
+        user_photo_count.pop(user_id, None)
+
+    t = Timer(60.0, auto_clear)
+    user_inactivity_timers[user_id] = t
+    t.start()
+
+def cancel_inactivity_timer(user_id):
+    """Cancels the inactivity timer if it exists."""
+    if user_id in user_inactivity_timers:
+        try:
+            user_inactivity_timers[user_id].cancel()
+        except:
+            pass
+        user_inactivity_timers.pop(user_id, None)
 
 # Per-user quality preference (default: "document" for high-quality document, "photo" for compressed photo)
 # Key: user_id (int), Value: "document" / "photo"
@@ -826,6 +859,7 @@ def handle_photos(message):
         return
     
     user_id = str(message.chat.id)
+    cancel_inactivity_timer(user_id)
     user_folder = os.path.join(TEMP_DIR, user_id)
     # CLOUD FIX: Absolute path path guaranteed folder creation
     os.makedirs(user_folder, exist_ok=True)
@@ -872,6 +906,7 @@ def handle_photos(message):
                 pass
         if total > 0:
             bot.send_message(chat_id, f"📸 {total} Images received! Send more, or type /generate.")
+            start_inactivity_timer(user_id, chat_id)
 
     timer = Timer(2.0, send_batch_reply)
     user_photo_timers[user_id] = timer
@@ -890,6 +925,7 @@ def handle_document_photos(message):
         return  # Silently ignore non-image documents
 
     user_id = str(message.chat.id)
+    cancel_inactivity_timer(user_id)
     user_folder = os.path.join(TEMP_DIR, user_id)
     os.makedirs(user_folder, exist_ok=True)
 
@@ -941,6 +977,7 @@ def handle_document_photos(message):
                 pass
         if total > 0:
             bot.send_message(chat_id, f"📸 {total} HD Images received! Send more, or type /generate.")
+            start_inactivity_timer(user_id, chat_id)
 
     timer = Timer(2.0, send_batch_reply)
     user_photo_timers[user_id] = timer
@@ -1007,6 +1044,7 @@ def clear_session(message):
         except: pass
         user_photo_timers.pop(user_id, None)
     
+    cancel_inactivity_timer(user_id)
     user_photo_count.pop(user_id, None)
 
     if os.path.exists(user_folder):
@@ -1294,6 +1332,8 @@ def process_listing(message):
 
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
+
+    cancel_inactivity_timer(user_id)
 
     # Double check folder and content existence
     if not os.path.exists(user_folder) or not os.listdir(user_folder):
