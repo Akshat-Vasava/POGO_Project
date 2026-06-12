@@ -2,10 +2,14 @@ import os
 import math
 import shutil
 import json
+import random
+import io
 import telebot
 from telebot import types, apihelper
 from PIL import Image, ImageDraw, ImageFont
-from threading import Timer
+from threading import Timer, Semaphore
+from concurrent.futures import ThreadPoolExecutor
+import gc
 import time
 import stat
 
@@ -82,8 +86,12 @@ if not TELEGRAM_BOT_TOKEN:
 # Hardcode your authorized numeric IDs here
 ADMIN_USERS = [5282482434] 
 FREE_TRIAL_COLLAGES = 5
+CANVAS_WIDTH = 4200  # High-resolution output width in pixels
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+# Global concurrency lock: only ONE collage builds at a time to cap peak RAM at ~700MB
+collage_semaphore = Semaphore(1)
 
 # Set global timeouts for pyTelegramBotAPI to prevent write timeouts on slow connections
 apihelper.CONNECT_TIMEOUT = 90
@@ -132,6 +140,10 @@ user_layout_settings = {}
 # Key: user_id (int)
 user_collage_count = {}
 premium_users = {}
+
+# Per-user file size limit in MB (default: 2)
+# Key: user_id (int), Value: integer 0-10
+user_limit_settings = {}
 
 # =========================================================
 # DATABASE INTEGRATION (MONGODB ATLAS)
@@ -188,7 +200,8 @@ def get_user_data(user_id):
                     "quality": doc.get("quality", "document"),
                     "layout": doc.get("layout", "auto"),
                     "collage_count": doc.get("collage_count", 0),
-                    "is_premium": doc.get("is_premium", False)
+                    "is_premium": doc.get("is_premium", False),
+                    "limit": doc.get("limit", 2)
                 }
         except Exception as e:
             print(f"[*] MongoDB error in get_user_data: {e}")
@@ -201,7 +214,8 @@ def get_user_data(user_id):
         "quality": user_quality_settings.get(u_id, "document"),
         "layout": user_layout_settings.get(u_id, "auto"),
         "collage_count": user_collage_count.get(u_id, 0),
-        "is_premium": premium_users.get(u_id, False)
+        "is_premium": premium_users.get(u_id, False),
+        "limit": user_limit_settings.get(u_id, 2)
     }
 
 def set_user_data(user_id, update_dict):
@@ -221,6 +235,7 @@ def set_user_data(user_id, update_dict):
                 elif k == "layout": mongo_update["layout"] = v
                 elif k == "collage_count": mongo_update["collage_count"] = v
                 elif k == "is_premium": mongo_update["is_premium"] = v
+                elif k == "limit": mongo_update["limit"] = v
                 
             if mongo_update:
                 users_col.update_one({"_id": u_id}, {"$set": mongo_update}, upsert=True)
@@ -237,6 +252,7 @@ def set_user_data(user_id, update_dict):
         elif k == "layout": user_layout_settings[u_id] = v
         elif k == "collage_count": user_collage_count[u_id] = v
         elif k == "is_premium": premium_users[u_id] = v
+        elif k == "limit": user_limit_settings[u_id] = v
         
     save_user_settings()
     return True
@@ -263,6 +279,7 @@ def migrate_local_to_mongodb():
         all_user_ids.update(user_layout_settings.keys())
         all_user_ids.update(user_collage_count.keys())
         all_user_ids.update(premium_users.keys())
+        all_user_ids.update(user_limit_settings.keys())
         
         if not all_user_ids:
             return
@@ -279,7 +296,8 @@ def migrate_local_to_mongodb():
                 "quality": user_quality_settings.get(u_id, "document"),
                 "layout": user_layout_settings.get(u_id, "auto"),
                 "collage_count": user_collage_count.get(u_id, 0),
-                "is_premium": premium_users.get(u_id, False)
+                "is_premium": premium_users.get(u_id, False),
+                "limit": user_limit_settings.get(u_id, 2)
             }
             bulk_docs.append(doc)
             
@@ -326,6 +344,7 @@ def save_user_settings():
         "layout_settings": {str(k): v for k, v in user_layout_settings.items()},
         "collage_count": {str(k): v for k, v in user_collage_count.items()},
         "premium_users": {str(k): v for k, v in premium_users.items()},
+        "limit_settings": {str(k): v for k, v in user_limit_settings.items()},
     }
     try:
         with open(SETTINGS_FILE, "w") as f:
@@ -337,7 +356,7 @@ def load_user_settings():
     """Loads all user preferences from the JSON file on startup."""
     global user_watermark_settings, user_watermark_text, user_watermark_colors
     global user_quality_settings, user_layout_settings
-    global user_collage_count, premium_users
+    global user_collage_count, premium_users, user_limit_settings
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -351,6 +370,7 @@ def load_user_settings():
         user_layout_settings = {int(k): v for k, v in data.get("layout_settings", {}).items()}
         user_collage_count = {int(k): v for k, v in data.get("collage_count", {}).items()}
         premium_users = {int(k): v for k, v in data.get("premium_users", {}).items()}
+        user_limit_settings = {int(k): v for k, v in data.get("limit_settings", {}).items()}
         print(f"[*] Loaded user settings for {len(user_watermark_settings)} user(s).")
     except Exception as e:
         print(f"[*] Warning: Could not load user settings: {e}")
@@ -465,8 +485,8 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
             for i in range(extra): 
                 layout[i] += 1
 
-    # Base width set to 2000px: High quality but safe for 512MB RAM servers
-    canvas_width = 2000 
+    # Base width set to 4200px for high-resolution output
+    canvas_width = CANVAS_WIDTH
     idx = 0
     rows_data = []
 
@@ -496,6 +516,10 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
             r = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
             final_row.append(r)
             row_h = new_h
+
+        # Aggressive GC: close first-pass resized intermediates immediately
+        for r in resized:
+            r.close()
             
         rows_data.append((final_row, row_h))
 
@@ -509,11 +533,15 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
         for img in row:
             collage.paste(img, (x, y))
             x += img.width
+        # Aggressive GC: close final row images immediately after pasting
+        for img in row:
+            img.close()
         y += h
 
-    # Free up memory
+    # Free up source images
     for img in imgs: 
         img.close()
+    gc.collect()
 
     # Apply the perfectly scaled diagonal watermark (if enabled)
     if watermark_enabled:
@@ -523,6 +551,219 @@ def create_collage(image_folder, output_path, watermark_enabled=True, watermark_
     # Save with high quality
     collage.save(output_path, "JPEG", quality=95)
     return collage, output_path
+
+
+# =========================================================
+# 3b. PARALLEL 3-LAYOUT ENGINE & INTELLIGENT COMPRESSION
+# =========================================================
+def generate_layout_structure(n, variant):
+    """Generates a row-structure list for a given layout variant.
+    variant=1: Balanced 2-row grid
+    variant=2: 3-row grid (for shuffled images)
+    variant=3: 4-row grid (for shuffled images)
+    """
+    if n <= 1:
+        return [1]
+
+    if variant == 1:
+        # Balanced 2-row split
+        half = math.ceil(n / 2)
+        return [half, n - half]
+    elif variant == 2:
+        # 3-row grid
+        if n <= 2:
+            return [n]
+        rows_count = 3
+        base = n // rows_count
+        extra = n % rows_count
+        layout = [base] * rows_count
+        for i in range(extra):
+            layout[i] += 1
+        return [r for r in layout if r > 0]
+    elif variant == 3:
+        # 4-row grid
+        if n <= 3:
+            return [1] * n
+        rows_count = 4
+        base = n // rows_count
+        extra = n % rows_count
+        layout = [base] * rows_count
+        for i in range(extra):
+            layout[i] += 1
+        return [r for r in layout if r > 0]
+    return [n]
+
+
+def build_collage_from_images(images, layout_rows, canvas_width=CANVAS_WIDTH):
+    """Builds a seamless masonry collage from a list of PIL Image objects.
+    Returns a PIL Image object (not saved to disk).
+    """
+    idx = 0
+    rows_data = []
+
+    for count in layout_rows:
+        row_imgs = images[idx:idx + count]
+        idx += count
+
+        if not row_imgs:
+            continue
+
+        target_h = min(img.height for img in row_imgs)
+
+        resized = []
+        total_w = 0
+        for img in row_imgs:
+            ratio = target_h / img.height
+            new_w = int(img.width * ratio)
+            new_h = int(target_h)
+            r = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            resized.append(r)
+            total_w += new_w
+
+        scale = canvas_width / total_w if total_w > 0 else 1
+        final_row = []
+        row_h = 0
+        for img in resized:
+            new_w = int(img.width * scale)
+            new_h = int(img.height * scale)
+            r = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            final_row.append(r)
+            row_h = new_h
+
+        # Aggressive GC: close first-pass resized intermediates immediately
+        for r in resized:
+            r.close()
+
+        rows_data.append((final_row, row_h))
+
+    total_height = sum(h for _, h in rows_data)
+    if total_height == 0:
+        return None
+
+    collage = Image.new("RGB", (canvas_width, total_height), (255, 255, 255))
+
+    y = 0
+    for row, h in rows_data:
+        x = 0
+        for img in row:
+            collage.paste(img, (x, y))
+            x += img.width
+        # Aggressive GC: close final row images immediately after pasting
+        for img in row:
+            img.close()
+        y += h
+
+    return collage
+
+
+def build_single_variant(image_folder, image_files, variant, canvas_width, wm_enabled, wm_text, wm_color):
+    """Thread-safe worker that builds one complete layout variant.
+    Each thread loads its own images from disk to manage memory independently.
+    """
+    try:
+        # Load images from disk (each thread gets its own copies)
+        imgs = [Image.open(os.path.join(image_folder, f)).convert("RGB") for f in image_files]
+
+        # Shuffle for variants 2 and 3 using a thread-local RNG for safety
+        if variant in (2, 3):
+            rng = random.Random()
+            rng.shuffle(imgs)
+
+        layout_rows = generate_layout_structure(len(imgs), variant)
+        collage = build_collage_from_images(imgs, layout_rows, canvas_width)
+
+        # Close loaded images to free memory
+        for img in imgs:
+            img.close()
+        del imgs
+        gc.collect()
+
+        if collage is None:
+            return None
+
+        # Apply watermark if enabled
+        if wm_enabled:
+            color_info = WATERMARK_COLORS.get(wm_color, WATERMARK_COLORS["black"])
+            collage = apply_watermark(collage, wm_text, color_rgba=color_info["rgba"])
+
+        return collage
+    except Exception as e:
+        print(f"[*] Error building variant {variant}: {e}")
+        return None
+
+
+def compress_collage(image, mb_limit):
+    """Compresses a PIL Image to fit within the given MB limit using intelligent
+    downscaling and binary-search JPEG quality optimization.
+
+    Args:
+        image: PIL Image object to compress.
+        mb_limit: Maximum file size in MB (0 = no limit, uses 10MB ceiling).
+
+    Returns:
+        io.BytesIO buffer containing the final JPEG bytes, seeked to position 0.
+    """
+    if mb_limit == 0:
+        target_bytes = 10 * 1024 * 1024  # 10MB ceiling for "no limit"
+    else:
+        target_bytes = mb_limit * 1024 * 1024
+
+    current_image = image.copy()
+
+    # Step A: Downscale loop — shrink dimensions until quality=20 fits the budget
+    for _ in range(10):
+        buf = io.BytesIO()
+        current_image.save(buf, "JPEG", quality=20, optimize=True, subsampling=2)
+        if buf.tell() <= target_bytes:
+            buf.close()
+            break
+        buf.close()
+        # Scale down by 90%
+        new_w = int(current_image.width * 0.9)
+        new_h = int(current_image.height * 0.9)
+        if new_w < 100 or new_h < 100:
+            break  # Safety floor: don't shrink below 100px
+        old_image = current_image
+        current_image = current_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        old_image.close()  # Aggressive GC: close pre-resize image immediately
+
+    # Step B: Binary search for maximum JPEG quality that fits the budget
+    lo, hi = 20, 95
+    best_buf = None
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        buf = io.BytesIO()
+        current_image.save(buf, "JPEG", quality=mid, optimize=True, progressive=True, subsampling=2)
+
+        if buf.tell() <= target_bytes:
+            if best_buf is not None:
+                best_buf.close()  # Close previous best before replacing
+            best_buf = buf
+            lo = mid + 1
+        else:
+            buf.close()
+            hi = mid - 1
+
+    # Safety fallback: if progressive encoding pushed it over, try without progressive
+    if best_buf is None:
+        best_buf = io.BytesIO()
+        current_image.save(best_buf, "JPEG", quality=20, optimize=True, progressive=False, subsampling=2)
+
+    # Final safety: re-check with progressive=False if still over budget
+    if best_buf.tell() > target_bytes:
+        fallback_buf = io.BytesIO()
+        current_image.save(fallback_buf, "JPEG", quality=20, optimize=True, progressive=False, subsampling=2)
+        if fallback_buf.tell() < best_buf.tell():
+            best_buf.close()
+            best_buf = fallback_buf
+        else:
+            fallback_buf.close()
+
+    current_image.close()
+    gc.collect()
+    best_buf.seek(0)
+    return best_buf
 
 
 # =========================================================
@@ -570,7 +811,8 @@ def send_help(message):
         "🗑️ /clear — Discard uploaded photos and start over.\n"
         "🔖 /watermark — Toggle watermark on/off, set custom text & color.\n"
         "⚡ /quality — Choose between high-quality document or fast photo output.\n"
-        "📐 /layout — Pick collage layout style (Auto, Grid, Vertical, Horizontal).\n"
+        "📐 /layout — Pick collage layout style (Auto, Grid, Vertical, Horizontal, 3-Variant).\n"
+        "📦 /limit — Set collage file size limit (0-10 MB).\n"
         "📊 /mystatus — Check your plan status & remaining free trials.\n\n"
         f"📌 _Photo limit: {MAX_PHOTOS_PER_SESSION} images per session._"
     )
@@ -601,16 +843,15 @@ def handle_photos(message):
     with open(file_path, 'wb') as new_file:
         new_file.write(downloaded_file)
 
-    # Increment photo count for this user
-    user_photo_count[user_id] = user_photo_count.get(user_id, 0) + 1
-
-    # Send an instant "Receiving images..." message on the first photo of a batch
-    if user_photo_count[user_id] == 1:
+    # Send "Receiving images..." only if one isn't already showing for this user
+    # Reserve slot IMMEDIATELY to prevent race condition with parallel handler threads
+    if user_id not in user_photo_receiving_msg:
+        user_photo_receiving_msg[user_id] = None  # Claim slot before slow network call
         try:
             receiving_msg = bot.send_message(message.chat.id, "📥 _Receiving images..._", parse_mode='Markdown')
             user_photo_receiving_msg[user_id] = receiving_msg
         except Exception:
-            pass
+            user_photo_receiving_msg.pop(user_id, None)
 
     # Cancel any existing timer for this user (debounce)
     if user_id in user_photo_timers:
@@ -619,17 +860,18 @@ def handle_photos(message):
     # Start a new 2-second timer; fires only after user stops sending photos
     chat_id = message.chat.id
     def send_batch_reply():
-        count = user_photo_count.pop(user_id, 0)
         user_photo_timers.pop(user_id, None)
+        # Count actual files in the folder for an accurate total
+        total = len([f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and f != "final_collage.jpg"])
         # Delete the "Receiving images..." message
         receiving_msg = user_photo_receiving_msg.pop(user_id, None)
-        if receiving_msg:
+        if receiving_msg is not None:
             try:
                 bot.delete_message(receiving_msg.chat.id, receiving_msg.message_id)
             except Exception:
                 pass
-        if count > 0:
-            bot.send_message(chat_id, f"📸 {count} Images received! Send more, or type /generate.")
+        if total > 0:
+            bot.send_message(chat_id, f"📸 {total} Images received! Send more, or type /generate.")
 
     timer = Timer(2.0, send_batch_reply)
     user_photo_timers[user_id] = timer
@@ -670,16 +912,15 @@ def handle_document_photos(message):
     with open(file_path, 'wb') as new_file:
         new_file.write(downloaded_file)
 
-    # Increment photo count for this user (shares batch tracking with photo handler)
-    user_photo_count[user_id] = user_photo_count.get(user_id, 0) + 1
-
-    # Send an instant "Receiving images..." message on the first image of a batch
-    if user_photo_count[user_id] == 1:
+    # Send "Receiving images..." only if one isn't already showing for this user
+    # Reserve slot IMMEDIATELY to prevent race condition with parallel handler threads
+    if user_id not in user_photo_receiving_msg:
+        user_photo_receiving_msg[user_id] = None  # Claim slot before slow network call
         try:
             receiving_msg = bot.send_message(message.chat.id, "📥 _Receiving HD images..._", parse_mode='Markdown')
             user_photo_receiving_msg[user_id] = receiving_msg
         except Exception:
-            pass
+            user_photo_receiving_msg.pop(user_id, None)
 
     # Cancel any existing timer for this user (debounce)
     if user_id in user_photo_timers:
@@ -688,17 +929,18 @@ def handle_document_photos(message):
     # Start a new 2-second timer; fires only after user stops sending
     chat_id = message.chat.id
     def send_batch_reply():
-        count = user_photo_count.pop(user_id, 0)
         user_photo_timers.pop(user_id, None)
+        # Count actual files in the folder for an accurate total
+        total = len([f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and f != "final_collage.jpg"])
         # Delete the "Receiving images..." message
         receiving_msg = user_photo_receiving_msg.pop(user_id, None)
-        if receiving_msg:
+        if receiving_msg is not None:
             try:
                 bot.delete_message(receiving_msg.chat.id, receiving_msg.message_id)
             except Exception:
                 pass
-        if count > 0:
-            bot.send_message(chat_id, f"📸 {count} HD Images received! Send more, or type /generate.")
+        if total > 0:
+            bot.send_message(chat_id, f"📸 {total} HD Images received! Send more, or type /generate.")
 
     timer = Timer(2.0, send_batch_reply)
     user_photo_timers[user_id] = timer
@@ -786,7 +1028,8 @@ def toggle_layout(message):
         "auto": "🤖 Auto (Default)",
         "vertical": "↕️ Single Column (Vertical)",
         "horizontal": "↔️ Single Row (Horizontal)",
-        "grid": "🔲 Balanced Grid"
+        "grid": "🔲 Balanced Grid",
+        "3variant": "🎲 3-Variant (3 Layouts)"
     }
     status = style_names.get(current, "🤖 Auto (Default)")
 
@@ -798,6 +1041,9 @@ def toggle_layout(message):
     markup.add(
         types.InlineKeyboardButton("↕️ Vertical Column", callback_data="l_vertical"),
         types.InlineKeyboardButton("↔️ Horizontal Row", callback_data="l_horizontal")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🎲 3-Variant", callback_data="l_3variant")
     )
     
     bot.send_message(
@@ -811,7 +1057,7 @@ def toggle_layout(message):
     'wm_on', 'wm_off', 'wm_text', 'wm_color_menu', 'wm_back',
     'wmc_black', 'wmc_white', 'wmc_red', 'wmc_yellow',
     'q_document', 'q_photo',
-    'l_auto', 'l_grid', 'l_vertical', 'l_horizontal'
+    'l_auto', 'l_grid', 'l_vertical', 'l_horizontal', 'l_3variant'
 ])
 def callback_handler(call):
     user_id = call.from_user.id
@@ -974,6 +1220,14 @@ def callback_handler(call):
             parse_mode='Markdown'
         )
         bot.answer_callback_query(call.id, "Saved: Horizontal Row ↔️")
+    elif call.data == "l_3variant":
+        set_user_data(user_id, {"layout": "3variant"})
+        bot.edit_message_text(
+            "📐 **Collage Layout Settings**\n\nCurrent style: 🎲 3-Variant (3 Layouts)\n\n_The bot will generate 3 different layout variants of your collage simultaneously._",
+            call.message.chat.id, call.message.message_id,
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id, "Saved: 3-Variant 🎲")
 
 def receive_custom_watermark_text(message):
     """Captures the user's custom watermark text from the next message."""
@@ -991,6 +1245,45 @@ def receive_custom_watermark_text(message):
         parse_mode='Markdown'
     )
 
+@bot.message_handler(commands=['limit'])
+def set_limit(message):
+    """Lets the user set their collage file size limit in MB."""
+    user_id = message.from_user.id
+    args = message.text.split()
+
+    if len(args) < 2:
+        user_data = get_user_data(user_id)
+        current_limit = user_data["limit"]
+        limit_display = "No limit (max quality, 10MB ceiling)" if current_limit == 0 else f"{current_limit} MB"
+        bot.reply_to(
+            message,
+            f"📦 **File Size Limit Settings**\n\n"
+            f"Current limit: **{limit_display}**\n\n"
+            f"Usage: `/limit <0-10>`\n"
+            f"• `0` = No limit (max quality, up to 10MB)\n"
+            f"• `1-10` = Maximum file size in MB\n\n"
+            f"Example: `/limit 5`",
+            parse_mode='Markdown'
+        )
+        return
+
+    try:
+        mb_value = int(args[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid input. Please enter a number between 0 and 10.")
+        return
+
+    if mb_value < 0 or mb_value > 10:
+        bot.reply_to(message, "❌ Limit must be between 0 and 10 MB.")
+        return
+
+    set_user_data(user_id, {"limit": mb_value})
+
+    if mb_value == 0:
+        bot.reply_to(message, "✅ File size limit removed! Collages will be generated at maximum quality (up to 10MB ceiling).", parse_mode='Markdown')
+    else:
+        bot.reply_to(message, f"✅ File size limit set to **{mb_value} MB**. Collages will be intelligently compressed to fit.", parse_mode='Markdown')
+
 @bot.message_handler(commands=['generate'])
 def process_listing(message):
     user_id_int = message.from_user.id
@@ -1001,7 +1294,6 @@ def process_listing(message):
 
     user_id = str(message.chat.id)
     user_folder = os.path.join(TEMP_DIR, user_id)
-    collage_path = os.path.join(user_folder, "final_collage.jpg")
 
     # Double check folder and content existence
     if not os.path.exists(user_folder) or not os.listdir(user_folder):
@@ -1012,8 +1304,28 @@ def process_listing(message):
     image_files = [f for f in os.listdir(user_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) and f != "final_collage.jpg"]
     num_images = len(image_files)
 
-    caption_text = f"⚙️ Building collage from {num_images} images..."
-    loading_gif = "https://www.gifcen.com/wp-content/uploads/2022/11/one-piece-gif-1.gif" # One Piece loading spinner
+    if num_images == 0:
+        bot.reply_to(message, "Send photos first, then /generate.")
+        return
+
+    # Fetch all user settings from database
+    user_data = get_user_data(user_id_int)
+    wm_enabled = user_data["watermark_enabled"]
+    wm_text = user_data["watermark_text"]
+    wm_color = user_data["watermark_color"]
+    quality_pref = user_data["quality"]
+    layout_pref = user_data["layout"]
+    mb_limit = user_data["limit"]
+    wm_label = "watermarked " if wm_enabled else ""
+
+    is_3variant = (layout_pref == "3variant")
+
+    if is_3variant:
+        caption_text = f"⚙️ Building 3 layout variants from {num_images} images..."
+    else:
+        caption_text = f"⚙️ Building collage from {num_images} images..."
+
+    loading_gif = "https://www.gifcen.com/wp-content/uploads/2022/11/one-piece-gif-1.gif"
 
     # Send the loading animation (or fallback to message)
     try:
@@ -1021,56 +1333,104 @@ def process_listing(message):
     except Exception:
         m = bot.send_message(message.chat.id, caption_text)
 
-    try:
-        user_data = get_user_data(message.from_user.id)
-        watermark_on = user_data["watermark_enabled"]
-        wm_text = user_data["watermark_text"]
-        layout_pref = user_data["layout"]
-        wm_color = user_data["watermark_color"]
-        collage_result = create_collage(
-            user_folder, 
-            collage_path, 
-            watermark_enabled=watermark_on, 
-            watermark_text=wm_text, 
-            layout_style=layout_pref,
-            watermark_color=wm_color
-        )
-        if not collage_result:
-            try:
-                bot.delete_message(m.chat.id, m.message_id)
-            except: pass
-            bot.send_message(message.chat.id, "Error building collage.")
-            return
-            
-        _, final_path = collage_result
-        
-        # Send collage based on user's format preference
-        quality_pref = user_data["quality"]
-        wm_label = "watermarked " if watermark_on else ""
+    # Acquire the global semaphore — only ONE collage builds at a time to cap RAM
+    acquired = collage_semaphore.acquire(blocking=False)
+    if not acquired:
+        bot.send_message(message.chat.id, "⏳ _Another collage is being built. You've been queued, please wait..._", parse_mode='Markdown')
+        collage_semaphore.acquire()  # Block until the other build finishes
 
-        with open(final_path, 'rb') as file_data:
+    try:
+        if is_3variant:
+            # === 3-VARIANT PARALLEL ENGINE ===
+            # Build 3 variants in parallel — each thread loads its own images from disk
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = []
+                for variant in (1, 2, 3):
+                    future = executor.submit(
+                        build_single_variant, user_folder, image_files, variant, CANVAS_WIDTH,
+                        wm_enabled, wm_text, wm_color
+                    )
+                    futures.append(future)
+
+                collages = [f.result() for f in futures]
+
+            # Compress and send each variant
+            for i, collage in enumerate(collages, 1):
+                if collage is None:
+                    bot.send_message(message.chat.id, f"⚠️ Layout {i}/3 failed to generate.")
+                    continue
+
+                compressed_buf = compress_collage(collage, mb_limit)
+                collage.close()
+                del collage
+                gc.collect()
+                file_name = f"Collage_Layout_{i}.jpg"
+
+                if quality_pref == "photo":
+                    bot.send_photo(
+                        message.chat.id,
+                        compressed_buf,
+                        caption=f"🖼️ Layout {i}/3 — {wm_label}collage!",
+                        timeout=90
+                    )
+                else:
+                    bot.send_document(
+                        message.chat.id,
+                        compressed_buf,
+                        caption=f"📄 Layout {i}/3 — High-quality {wm_label}collage!",
+                        visible_file_name=file_name,
+                        timeout=90
+                    )
+                compressed_buf.close()
+
+        else:
+            # === STANDARD SINGLE COLLAGE PATH ===
+            collage_path = os.path.join(user_folder, "final_collage.jpg")
+            collage_result = create_collage(
+                user_folder, collage_path,
+                watermark_enabled=wm_enabled,
+                watermark_text=wm_text,
+                layout_style=layout_pref,
+                watermark_color=wm_color
+            )
+            if not collage_result:
+                try:
+                    bot.delete_message(m.chat.id, m.message_id)
+                except: pass
+                bot.send_message(message.chat.id, "Error building collage.")
+                return
+
+            collage_img, _ = collage_result
+
+            # Intelligent compression to fit within user's MB limit
+            compressed_buf = compress_collage(collage_img, mb_limit)
+            collage_img.close()
+            del collage_img
+            gc.collect()
+
             if quality_pref == "photo":
                 bot.send_photo(
                     message.chat.id,
-                    file_data,
+                    compressed_buf,
                     caption=f"Here's your {wm_label}collage!",
                     timeout=90
                 )
             else:
                 bot.send_document(
                     message.chat.id,
-                    file_data,
+                    compressed_buf,
                     caption=f"Here's your high-quality {wm_label}image!",
                     visible_file_name="Galley_La_Collage.jpg",
                     timeout=90
                 )
+            compressed_buf.close()
 
-        # Free up loading message to prevent chat clutter after collage has been sent
+        # Free up loading message
         try:
             bot.delete_message(m.chat.id, m.message_id)
         except: pass
 
-        # Increment user's collage count and save settings
+        # Increment user's collage count
         u_id = message.from_user.id
         new_count = user_data["collage_count"] + 1
         set_user_data(u_id, {"collage_count": new_count})
@@ -1092,6 +1452,10 @@ def process_listing(message):
                 safe_delete_folder(user_folder)
         except: pass
         return  # Stop here — do not send misleading "Session cleared" after an error
+    finally:
+        # ALWAYS release the semaphore so the next user can build
+        collage_semaphore.release()
+        gc.collect()
 
     # CLOUD FIX: Safe Cleanup prevents random Windows permissions/ghost errors from locking folders
     try:
@@ -1100,7 +1464,7 @@ def process_listing(message):
     except Exception as e:
         # Prints to console, does not notify user
         print(f"[*] Cleanup warning for {user_id}: {e}")
-    
+
     bot.send_message(message.chat.id, "✅ Session cleared.")
 
 @bot.message_handler(commands=['mystatus'])
