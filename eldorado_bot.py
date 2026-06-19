@@ -12,6 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import time
 import stat
+from telebot import apihelper
+
+# Route Telegram traffic through a free international HTTP proxy
+apihelper.proxy = {'https': 'http://45.8.105.234:80'}
 
 # Maximum number of photos a user can upload per session (prevents RAM exhaustion)
 MAX_PHOTOS_PER_SESSION = 20
